@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""
+git-ssh-helper: clone a git repository using a selected SSH private key via GIT_SSH_COMMAND.
+
+Usage:
+  git-ssh-helper REPO_URL [--key PATH] [--list-keys] [--ui] [--clone-dir DIR]
+
+Features:
+- Discover SSH keys via tools.ssh_keys.discover_keys()
+- Let user pick a key or provide one via --key
+- Construct GIT_SSH_COMMAND via tools.core.build_ssh_command
+- Run git clone with tools.core.run_git
+- Post-clone interactive actions: list branches, checkout, open shell (print), run custom git commands
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import sys
+from typing import List, Optional
+# Ensure repository root is on sys.path so local 'tools' package can be imported when running this script directly.
+_repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
+
+
+try:
+    from tools import ssh_keys, core
+except Exception:
+    # Fallback if package import behaves differently
+    import tools.ssh_keys as ssh_keys
+    import tools.core as core
+
+
+def list_keys_and_exit() -> None:
+    keys = ssh_keys.discover_keys()
+    print(json.dumps(keys, indent=2))
+
+
+def choose_key_interactively(keys: List[dict]) -> Optional[str]:
+    if keys:
+        print("Discovered SSH keys:")
+        for i, k in enumerate(keys, start=1):
+            print(f"{i}) {k.get('path')}  type={k.get('type')} perms_ok={k.get('permissions_ok')} reason={k.get('reason')}")
+    else:
+        print("No candidate private keys found under ~/.ssh")
+
+    print("0) Enter custom path to private key")
+    while True:
+        try:
+            choice = input("Select key number (or 0 to enter custom path): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if not choice:
+            continue
+        try:
+            idx = int(choice)
+        except ValueError:
+            print("Please enter a number")
+            continue
+        if idx == 0:
+            try:
+                path = input("Enter path to private key: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return None
+            if not path:
+                print("Empty path, try again")
+                continue
+            return os.path.expanduser(path)
+        if 1 <= idx <= len(keys):
+            return os.path.expanduser(keys[idx - 1].get('path'))
+        print("Invalid selection")
+
+
+def _repo_dir_from_url(url: str) -> str:
+    s = url.rstrip('/')
+    # scp-like (git@host:owner/repo.git)
+    if ':' in s and not s.lower().startswith(('http://', 'https://', 'ssh://', 'git://', 'git+ssh://')):
+        part = s.split(':', 1)[1]
+        name = part.rstrip('/').split('/')[-1]
+    else:
+        try:
+            from urllib.parse import urlparse
+
+            p = urlparse(s)
+            name = p.path.rstrip('/').split('/')[-1]
+        except Exception:
+            name = s.split('/')[-1]
+    if name.endswith('.git'):
+        name = name[:-4]
+    return name
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description='Clone a git repo using a selected SSH key (GIT_SSH_COMMAND).')
+    parser.add_argument('repo', nargs='?', help='Repository URL to clone', default=None)
+    parser.add_argument('--key', help='Path to private SSH key to use', default=None)
+    parser.add_argument('--list-keys', action='store_true', help='List discovered SSH keys and exit')
+    parser.add_argument('--ui', action='store_true', help='Launch GUI/TUI mode')
+    parser.add_argument('--clone-dir', help='Directory to clone into (optional)', default=None)
+    args = parser.parse_args()
+
+    if args.ui:
+        # Prefer GUI (Tkinter) if available, otherwise fall back to the TUI CLI
+        try:
+            from tools import gui_tk as gui_mod
+        except Exception:
+            try:
+                import tools.gui_tk as gui_mod
+            except Exception:
+                try:
+                    from tools import ui_tui as gui_mod
+                except Exception:
+                    import tools.ui_tui as gui_mod
+        try:
+            rc = gui_mod.run_gui()
+            return 0 if rc is None else int(rc)
+        except Exception as e:
+            print(f'GUI/TUI mode failed: {e}', file=sys.stderr)
+            return 3
+
+    if args.list_keys:
+        list_keys_and_exit()
+        return 0
+
+    # Determine key to use
+    selected_key = None
+    if args.key:
+        selected_key = os.path.expanduser(args.key)
+    else:
+        keys = ssh_keys.discover_keys()
+        selected_key = choose_key_interactively(keys)
+
+    if not selected_key:
+        print('No key selected, exiting', file=sys.stderr)
+        return 2
+
+    try:
+        ssh_cmd_list = core.build_ssh_command(selected_key)
+    except Exception as e:
+        print(f'Failed to build SSH command from key "{selected_key}": {e}', file=sys.stderr)
+        return 3
+
+    ssh_cmd_str = ' '.join(shlex.quote(p) for p in ssh_cmd_list)
+
+    if not args.repo:
+        print('Repository URL required. Use: git-ssh-helper REPO_URL [options]', file=sys.stderr)
+        return 1
+
+    # Prepare clone arguments
+    clone_args: List[str] = ['clone', args.repo]
+    if args.clone_dir:
+        clone_args.append(args.clone_dir)
+
+    print(f"Cloning {args.repo}...")
+    res = core.run_git(clone_args, env_overrides={'GIT_SSH_COMMAND': ssh_cmd_str})
+    if res.get('returncode') != 0:
+        print('git clone failed', file=sys.stderr)
+        if res.get('stderr'):
+            print(res.get('stderr'), file=sys.stderr)
+        elif res.get('stdout'):
+            print(res.get('stdout'), file=sys.stderr)
+        return 4
+
+    # Determine repo directory for post-clone actions
+    if args.clone_dir:
+        repo_dir = os.path.expanduser(args.clone_dir)
+    else:
+        repo_dir = os.path.join(os.getcwd(), _repo_dir_from_url(args.repo))
+
+    print(f"Cloned into {repo_dir}")
+
+    # Post-clone interactive menu
+    while True:
+        print('\nPost-clone actions:')
+        print('1) List branches')
+        print('2) Checkout branch')
+        print('3) Print shell command to open a shell in the repo')
+        print('4) Run custom git command')
+        print('0) Exit')
+        try:
+            choice = input('Select action: ').strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if choice == '1':
+            r = core.run_git(['branch', '-a'], cwd=repo_dir)
+            if r.get('stdout'):
+                print(r['stdout'])
+            else:
+                print(r.get('stderr') or '')
+        elif choice == '2':
+            branch = input('Enter branch name to checkout: ').strip()
+            if not branch:
+                print('No branch entered')
+                continue
+            r = core.run_git(['checkout', branch], cwd=repo_dir)
+            if r.get('returncode') == 0:
+                print(f'Checked out {branch}')
+            else:
+                print(r.get('stderr') or r.get('stdout') or '')
+        elif choice == '3':
+            print(f'To open a shell: cd {repo_dir} && $SHELL')
+        elif choice == '4':
+            cmd = input('Enter git command (e.g. status or log --oneline): ').strip()
+            if not cmd:
+                continue
+            try:
+                parsed = shlex.split(cmd)
+            except Exception:
+                print('Failed to parse command')
+                continue
+            if parsed and parsed[0] == 'git':
+                parsed = parsed[1:]
+            if not parsed:
+                print('No git subcommand provided')
+                continue
+            r = core.run_git(parsed, cwd=repo_dir)
+            if r.get('stdout'):
+                print(r['stdout'])
+            else:
+                print(r.get('stderr') or '')
+        elif choice == '0':
+            break
+        else:
+            print('Invalid selection')
+
+    return 0
+
+
+if __name__ == '__main__':
+    exit(main())

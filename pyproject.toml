@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ssh-tunnel"
+version = "0.1.0"
+description = "Helper to use SSH keys for Git operations (git-ssh-helper)."
+authors = [{name = "Maintainer", email = "maintainer@example.com"}]
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.8"
+
+[tool.setuptools]
+# Install the small wrapper script located in bin/
+script-files = ["bin/git-ssh-helper"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
