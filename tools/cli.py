@@ -45,11 +45,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if args.ui:
+        # Prefer Tkinter GUI; gui_tk.run_gui() already falls back to TUI internally.
+        # Only import ui_tui directly if gui_tk itself cannot be imported at all.
         try:
-            from tools import ui_tui as ui
+            from tools import gui_tk as _gui
         except Exception:
-            import tools.ui_tui as ui
-        rc = ui.run_tui()
+            try:
+                import tools.gui_tk as _gui
+            except Exception:
+                _gui = None  # type: ignore
+
+        if _gui is not None:
+            rc = _gui.run_gui()
+        else:
+            try:
+                from tools import ui_tui as _tui
+            except Exception:
+                import tools.ui_tui as _tui
+            rc = _tui.run_tui()
         return 0 if rc is None else int(rc)
 
     selected_key = None

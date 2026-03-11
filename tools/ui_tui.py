@@ -470,10 +470,9 @@ def run_tui() -> Optional[int]:
         if isinstance(return_value, int):
             return return_value
         return 0
-    except Exception:
-        # If curses fails at any point, print a traceback and fall back
-        print('Curses-based UI failed, falling back to CLI. Error:')
-        traceback.print_exc()
+    except Exception as _curses_err:
+        # curses fails in non-TTY environments (e.g. IDE terminals); fall back silently
+        print(f'Curses-based UI unavailable ({_curses_err}), falling back to CLI.')
         return run_cli_flow()
 
 

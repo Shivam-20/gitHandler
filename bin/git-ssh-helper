@@ -105,23 +105,25 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.ui:
-        # Prefer GUI (Tkinter) if available, otherwise fall back to the TUI CLI
+        # Prefer GUI (Tkinter) if available; gui_tk.run_gui() already falls back to TUI internally.
         try:
             from tools import gui_tk as gui_mod
+            rc = gui_mod.run_gui()
         except Exception:
             try:
                 import tools.gui_tk as gui_mod
+                rc = gui_mod.run_gui()
             except Exception:
                 try:
-                    from tools import ui_tui as gui_mod
+                    from tools import ui_tui as tui_mod
                 except Exception:
-                    import tools.ui_tui as gui_mod
-        try:
-            rc = gui_mod.run_gui()
-            return 0 if rc is None else int(rc)
-        except Exception as e:
-            print(f'GUI/TUI mode failed: {e}', file=sys.stderr)
-            return 3
+                    import tools.ui_tui as tui_mod
+                try:
+                    rc = tui_mod.run_tui()
+                except Exception as e:
+                    print(f'GUI/TUI mode failed: {e}', file=sys.stderr)
+                    return 3
+        return 0 if rc is None else int(rc)
 
     if args.list_keys:
         list_keys_and_exit()
