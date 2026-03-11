@@ -48,13 +48,9 @@ def validate_key(path: str) -> Dict:
     p = Path(path).expanduser()
     result = {"path": str(p), "type": None, "permissions_ok": False, "reason": ""}
 
+    # First, stat the file to obtain mode information (stat usually succeeds even when open would fail)
     try:
-        if not p.exists():
-            result["reason"] = "File does not exist"
-            return result
-        if not p.is_file():
-            result["reason"] = "Not a regular file"
-            return result
+        st0 = p.stat()
     except PermissionError:
         result["reason"] = "Permission denied while accessing path"
         return result
@@ -62,39 +58,72 @@ def validate_key(path: str) -> Dict:
         result["reason"] = f"OS error: {e}"
         return result
 
-    try:
-        st = p.stat()
-    except PermissionError:
-        result["reason"] = "Permission denied while stat'ing file"
-        return result
-    except OSError as e:
-        result["reason"] = f"Stat failed: {e}"
-        return result
-
-    mode = stat.S_IMODE(st.st_mode)
-    # Permissions are considered OK if no group/other bits are set and file is not executable
-    permissions_ok = ((mode & (stat.S_IRWXG | stat.S_IRWXO)) == 0) and ((mode & stat.S_IXUSR) == 0)
+    mode = stat.S_IMODE(st0.st_mode)
+    # Permissions are considered OK if owner has read, no group/other bits, and file is not executable
+    permissions_ok = (
+        (mode & (stat.S_IRWXG | stat.S_IRWXO)) == 0
+        and (mode & stat.S_IXUSR) == 0
+        and (mode & stat.S_IRUSR) != 0
+    )
     result["permissions_ok"] = permissions_ok
 
-    # Read the first chunk to identify PEM/OpenSSH headers
+    # Attempt to open the file safely to read header. Use O_NOFOLLOW when available to avoid symlink attacks.
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
     try:
-        with p.open("rb") as fh:
-            head = fh.read(8192)
-    except Exception as e:
-        result["reason"] = f"Failed to read file: {e}"
+        fd = os.open(str(p), flags)
+    except OSError as e:
+        # Could not open file (e.g., permission denied) — still return permissions_ok based on stat
+        result["reason"] = f"Failed to open file: {e}"
         return result
 
-    ktype = _detect_type_from_headers(head)
-    result["type"] = ktype
+    try:
+        try:
+            st = os.fstat(fd)
+        except OSError as e:
+            result["reason"] = f"fstat failed: {e}"
+            return result
 
-    if ktype is None:
-        result["reason"] = "No recognized private key header found"
-    else:
-        if permissions_ok:
-            result["reason"] = "OK"
+        # Ensure we opened a regular file
+        if not stat.S_ISREG(st.st_mode):
+            result["reason"] = "Not a regular file"
+            return result
+
+        # Basic TOCTOU check: ensure inode/dev didn't change between stat and open
+        try:
+            if st0.st_ino != st.st_ino or st0.st_dev != st.st_dev:
+                result["reason"] = "File changed between stat and open"
+                return result
+        except AttributeError:
+            # Platforms without st_ino/st_dev: skip this check
+            pass
+
+        # Read header from file descriptor
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            head = os.read(fd, 8192)
+        except Exception as e:
+            result["reason"] = f"Failed to read file: {e}"
+            return result
+
+        ktype = _detect_type_from_headers(head)
+        result["type"] = ktype
+
+        if ktype is None:
+            result["reason"] = "No recognized private key header found"
         else:
-            result["reason"] = f"Permissions too open: {oct(mode)}"
-    return result
+            if permissions_ok:
+                result["reason"] = "OK"
+            else:
+                result["reason"] = f"Permissions too open: {oct(mode)}"
+        return result
+    finally:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
 
 
 def discover_keys() -> List[Dict]:
@@ -111,11 +140,9 @@ def discover_keys() -> List[Dict]:
     if not ssh_dir.is_dir():
         return [{"path": str(ssh_dir), "type": None, "permissions_ok": False, "reason": "~/.ssh exists but is not a directory"}]
 
-    candidates = set()
-    common_names = {"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
-
+    # Iterate deterministically and validate each file safely inside validate_key().
     try:
-        for entry in ssh_dir.iterdir():
+        for entry in sorted(ssh_dir.iterdir(), key=lambda p: str(p)):
             try:
                 if not entry.is_file():
                     continue
@@ -123,26 +150,11 @@ def discover_keys() -> List[Dict]:
                 # Skip items we cannot inspect
                 continue
 
-            if entry.name in common_names:
-                candidates.add(entry)
-                continue
-
-            # Read a small portion to detect private key headers
-            try:
-                with entry.open("rb") as fh:
-                    head = fh.read(8192)
-            except Exception:
-                continue
-
-            up = head.upper()
-            if b"-----BEGIN " in up and b"PRIVATE KEY" in up:
-                candidates.add(entry)
-
+            res = validate_key(str(entry))
+            if res.get("type") is not None:
+                results.append(res)
     except PermissionError:
         return [{"path": str(ssh_dir), "type": None, "permissions_ok": False, "reason": "Permission denied listing ~/.ssh"}]
-
-    for cand in sorted(candidates, key=lambda p: str(p)):
-        results.append(validate_key(str(cand)))
 
     return results
 
