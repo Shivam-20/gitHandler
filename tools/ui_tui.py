@@ -54,7 +54,9 @@ def choose_key_interactively(keys: List[Dict]) -> Optional[str]:
     if keys:
         print("Discovered SSH keys:")
         for i, k in enumerate(keys, start=1):
-            print(f"{i}) {k.get('path')}  type={k.get('type')} perms_ok={k.get('permissions_ok')} reason={k.get('reason')}")
+            dup = '[DUP]' if k.get('duplicate') else ''
+            fp = k.get('fingerprint') or '<no-fp>'
+            print(f"{i}) {k.get('path')} {dup}  type={k.get('type')} fp={fp} perms_ok={k.get('permissions_ok')} reason={k.get('reason')}")
     else:
         print("No candidate private keys found under ~/.ssh")
 

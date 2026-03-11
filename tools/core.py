@@ -14,7 +14,12 @@ from __future__ import annotations
 import os
 import subprocess
 import re
+import json
+import shlex
+import logging
 from typing import List, Optional, Dict
+from pathlib import Path
+import stat
 
 
 def build_ssh_command(key_path: str) -> List[str]:
@@ -100,6 +105,54 @@ def validate_repo_url(url: str) -> bool:
         return True
 
     return False
+
+
+def get_logger(name: str = 'gitHandler', json_out: bool = False):
+    """Return a configured logger. If json_out is True, the logger emits compact JSON lines.
+
+    Note: The returned logger will add a StreamHandler on first call only.
+    """
+    logger = logging.getLogger(name)
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    ch = logging.StreamHandler()
+    if json_out:
+        import datetime as _dt
+
+        class JsonFormatter(logging.Formatter):
+            def format(self, record):
+                payload = {
+                    'ts': _dt.datetime.utcfromtimestamp(record.created).isoformat() + 'Z',
+                    'level': record.levelname,
+                    'name': record.name,
+                    'msg': record.getMessage(),
+                }
+                if record.exc_info:
+                    payload['exc'] = self.formatException(record.exc_info)
+                return json.dumps(payload)
+
+        ch.setFormatter(JsonFormatter())
+    else:
+        ch.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
+    logger.addHandler(ch)
+    return logger
+
+
+def create_repo_wrapper(repo_path: str, key_path: str, wrapper_name: str = 'git-ssh-wrapper') -> str:
+    """Create a small executable wrapper script in repo_path that invokes ssh with the given identity file.
+
+    Returns the path to the wrapper script.
+    """
+    rp = Path(repo_path)
+    if not rp.exists():
+        rp.mkdir(parents=True, exist_ok=True)
+    wrapper = rp / wrapper_name
+    script = "#!/bin/sh\nexec ssh -i {} -o IdentitiesOnly=yes \"$@\"\n".format(shlex.quote(str(key_path)))
+    wrapper.write_text(script)
+    # Ensure the wrapper is executable
+    wrapper.chmod(0o755)
+    return str(wrapper)
 
 
 if __name__ == '__main__':
