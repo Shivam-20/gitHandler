@@ -23,11 +23,12 @@ from typing import List, Dict, Optional
 
 # Import the project helpers (follow the pattern used elsewhere in the repo)
 try:
-    from tools import ssh_keys, core, clone_actions
+    from tools import ssh_keys, core, clone_actions, ssh_config
 except Exception:
     import tools.ssh_keys as ssh_keys
     import tools.core as core
     import tools.clone_actions as clone_actions
+    import tools.ssh_config as ssh_config
 
 
 def _repo_dir_from_url(url: str) -> str:
@@ -122,7 +123,7 @@ def _clone_with_key(repo: str, clone_dir: Optional[str], selected_key: str) -> O
     return repo_dir
 
 
-def _post_clone_cli(repo_dir: str) -> None:
+def _post_clone_cli(repo_dir: str, selected_key: Optional[str] = None) -> None:
     """Simple CLI interaction loop for post-clone actions."""
     while True:
         print('\nPost-clone actions:')
@@ -130,6 +131,7 @@ def _post_clone_cli(repo_dir: str) -> None:
         print('2) Checkout branch')
         print('3) Print shell command to open a shell in the repo')
         print('4) Run custom git command')
+        print('5) Update remote SSH URL to use selected key')
         print('0) Exit')
         try:
             choice = input('Select action: ').strip()
@@ -174,6 +176,28 @@ def _post_clone_cli(repo_dir: str) -> None:
                 print(r['stdout'])
             else:
                 print(r.get('stderr') or '')
+        elif choice == '5':
+            if not selected_key:
+                print('No key available to update remotes with')
+                continue
+            print('Showing planned changes (dry-run)')
+            res = ssh_config.update_repo_remotes(repo_dir, selected_key, remotes=None, dry_run=True, backup_dir=None, yes=False)
+            for r in res:
+                if r.get('skipped'):
+                    print(f"{r.get('remote')}: skipped - {r.get('reason')}")
+                else:
+                    print(f"{r.get('remote')}: {r.get('original_url')} -> {r.get('new_url')}")
+            ans = input('Apply these changes? (y/N): ').strip().lower()
+            if ans == 'y':
+                applied = ssh_config.update_repo_remotes(repo_dir, selected_key, remotes=None, dry_run=False, backup_dir=None, yes=True)
+                for a in applied:
+                    if a.get('skipped'):
+                        print(f"{a.get('remote')}: skipped - {a.get('reason')}")
+                    else:
+                        print(f"{a.get('remote')}: updated -> {a.get('new_url')}")
+            else:
+                print('Aborted')
+            continue
         elif choice == '0':
             break
         else:
@@ -207,7 +231,7 @@ def run_cli_flow() -> int:
     if not repo_dir:
         return 4
 
-    _post_clone_cli(repo_dir)
+    _post_clone_cli(repo_dir, selected_key)
     return 0
 
 
@@ -312,11 +336,12 @@ def _curses_main(stdscr) -> int:
         stdscr.addstr(4, 2, '2) Checkout branch')
         stdscr.addstr(5, 2, '3) Print shell command to open a shell in the repo')
         stdscr.addstr(6, 2, '4) Run custom git command')
-        stdscr.addstr(7, 2, '0) Exit')
-        stdscr.addstr(9, 2, 'Selection: ')
+        stdscr.addstr(7, 2, '5) Update remote SSH URL to use selected key')
+        stdscr.addstr(8, 2, '0) Exit')
+        stdscr.addstr(10, 2, 'Selection: ')
         stdscr.refresh()
         curses.echo()
-        ch = stdscr.getstr(9, 12, 16).decode('utf-8').strip()
+        ch = stdscr.getstr(10, 12, 16).decode('utf-8').strip()
         curses.noecho()
         if ch == '1':
             branches = clone_actions.list_branches(repo_dir)
@@ -382,6 +407,44 @@ def _curses_main(stdscr) -> int:
                     break
             stdscr.addstr(maxy - 1, 0, 'Press any key to continue...')
             stdscr.getch()
+        elif ch == '5':
+            # show dry-run first
+            stdscr.clear()
+            stdscr.addstr(0, 0, 'Planning update (dry-run)...')
+            stdscr.refresh()
+            results = ssh_config.update_repo_remotes(repo_dir, selected_key, remotes=None, dry_run=True, backup_dir=None, yes=False)
+            y = 2
+            for r in results:
+                line = f"{r.get('remote')}: {'skipped' if r.get('skipped') else 'will update -> ' + (r.get('new_url') or '')}"
+                try:
+                    stdscr.addstr(y, 2, line[: max(0, maxx - 4)])
+                except Exception:
+                    pass
+                y += 1
+                if y >= maxy - 2:
+                    break
+            stdscr.addstr(maxy - 1, 0, 'Apply changes? (y/N): ')
+            curses.echo()
+            ans = stdscr.getstr(maxy - 1, len('Apply changes? (y/N): '), 3).decode('utf-8').strip().lower()
+            curses.noecho()
+            if ans == 'y':
+                applied = ssh_config.update_repo_remotes(repo_dir, selected_key, remotes=None, dry_run=False, backup_dir=None, yes=True)
+                stdscr.clear()
+                y = 0
+                for a in applied:
+                    line = f"{a.get('remote')}: {'skipped' if a.get('skipped') else 'updated -> ' + (a.get('new_url') or '')}"
+                    try:
+                        stdscr.addstr(y, 0, line[: max(0, maxx - 1)])
+                    except Exception:
+                        pass
+                    y += 1
+                    if y >= maxy - 2:
+                        break
+                stdscr.addstr(maxy - 1, 0, 'Press any key to continue...')
+                stdscr.getch()
+            else:
+                stdscr.addstr(maxy - 1, 0, 'Aborted. Press any key to continue...')
+                stdscr.getch()
         elif ch == '0' or ch == '':
             break
         else:

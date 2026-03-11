@@ -53,10 +53,10 @@ git-ssh-helper --help
 ### List discovered SSH keys
 
 ```bash
-git-ssh-helper --list-keys
+git-ssh-helper --list-keys --json
 ```
 
-Output is JSON — each entry includes the key path, detected type, permission status, and a human-readable reason.
+Output is JSON — each entry includes the key path, detected type, fingerprint, permission status, duplicate flag, and a human-readable reason.
 
 ### Clone with a specific key
 
@@ -68,6 +68,32 @@ git-ssh-helper --key ~/.ssh/id_ed25519 git@github.com:user/repo.git
 
 ```bash
 git-ssh-helper --key ~/.ssh/id_ed25519 --clone-dir ~/projects/myrepo git@github.com:user/repo.git
+```
+
+### Fix permissions (dry-run)
+
+```bash
+git-ssh-helper fix-permissions --dry-run --path ~/.ssh/id_ed25519
+```
+
+### Add a key to ssh-agent (start agent if needed)
+
+```bash
+git-ssh-helper add-to-agent --path ~/.ssh/id_ed25519 --start-agent
+```
+
+### Update repository remotes to use a selected key
+
+Dry-run preview (shows planned changes):
+
+```bash
+git-ssh-helper --update-remote --repo-dir /path/to/repo --key ~/.ssh/id_ed25519 --dry-run --backup-dir ~/.ssh/backup --json
+```
+
+Apply changes (non-interactive):
+
+```bash
+git-ssh-helper --update-remote --repo-dir /path/to/repo --key ~/.ssh/id_ed25519 --backup-dir ~/.ssh/backup --yes
 ```
 
 ### Interactive key selection (CLI)
