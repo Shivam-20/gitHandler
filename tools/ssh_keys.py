@@ -159,14 +159,134 @@ def discover_keys() -> List[Dict]:
     return results
 
 
-def _print_discovered():
+def _print_discovered(json_out: bool = False):
     keys = discover_keys()
     if not keys:
         print("No candidate private keys found under ~/.ssh")
         return
-    import json
-    print(json.dumps(keys, indent=2))
+    import json as _json
+    if json_out:
+        print(_json.dumps(keys, indent=2))
+    else:
+        for k in keys:
+            print(f"{k['path']}: type={k['type']}, permissions_ok={k['permissions_ok']}, reason={k['reason']}")
+
+
+def fix_permissions_for_file(pth: str, backup_dir: Optional[str] = None, dry_run: bool = True) -> Dict:
+    """Attempt to make a single key's permissions secure (owner read/write only).
+
+    Returns a dict with keys: path, changed (bool), current_mode, would_set_mode, backup (path or None), reason
+    """
+    from shutil import copy2
+    import time as _time
+
+    p = Path(pth).expanduser()
+    res = {"path": str(p), "changed": False, "current_mode": None, "would_set_mode": None, "backup": None, "reason": ""}
+
+    try:
+        st = p.stat()
+    except Exception as e:
+        res["reason"] = f"Stat failed: {e}"
+        return res
+
+    mode = stat.S_IMODE(st.st_mode)
+    res["current_mode"] = oct(mode)
+
+    secure_mode = 0o600
+    permissions_ok = (
+        (mode & (stat.S_IRWXG | stat.S_IRWXO)) == 0
+        and (mode & stat.S_IXUSR) == 0
+        and (mode & stat.S_IRUSR) != 0
+    )
+
+    if permissions_ok:
+        res["reason"] = "Already secure"
+        return res
+
+    res["would_set_mode"] = oct(secure_mode)
+
+    if dry_run:
+        res["reason"] = "Dry run"
+        return res
+
+    # Perform backup if requested
+    if backup_dir:
+        bdir = Path(backup_dir).expanduser()
+        try:
+            bdir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            res["reason"] = f"Failed to create backup dir: {e}"
+            return res
+        bakname = f"{p.name}.{int(_time.time())}.bak"
+        bpath = bdir / bakname
+        try:
+            copy2(str(p), str(bpath))
+            res["backup"] = str(bpath)
+        except Exception as e:
+            res["reason"] = f"Backup failed: {e}"
+            return res
+
+    # Apply chmod
+    try:
+        os.chmod(str(p), secure_mode)
+    except Exception as e:
+        res["reason"] = f"chmod failed: {e}"
+        return res
+
+    try:
+        new_mode = stat.S_IMODE(p.stat().st_mode)
+    except Exception as e:
+        res["reason"] = f"Stat after chmod failed: {e}"
+        return res
+
+    res["changed"] = new_mode != mode
+    res["current_mode"] = oct(new_mode)
+    res["reason"] = "Permissions updated" if res["changed"] else "Permissions unchanged"
+    return res
+
+
+def fix_permissions(paths: Optional[list] = None, backup_dir: Optional[str] = None, dry_run: bool = True) -> List[Dict]:
+    """Fix permissions for a list of paths, or scan ~/.ssh when paths is None."""
+    results: List[Dict] = []
+    if paths is None:
+        keys = discover_keys()
+        paths = [k["path"] for k in keys]
+    for p in paths:
+        results.append(fix_permissions_for_file(p, backup_dir=backup_dir, dry_run=dry_run))
+    return results
+
+
+def _main():
+    import argparse as _argparse
+    import json as _json
+    parser = _argparse.ArgumentParser(prog="ssh_keys", description="Discover and manage SSH private keys under ~/.ssh")
+    sub = parser.add_subparsers(dest="command")
+    sub.required = False
+
+    d = sub.add_parser("discover", help="Discover keys")
+    d.add_argument("--json", action="store_true", dest="json_out", help="Output JSON")
+
+    f = sub.add_parser("fix-permissions", help="Fix permissions for keys")
+    f.add_argument("--path", "-p", action="append", help="Specific key path (repeatable). If omitted scan ~/.ssh")
+    f.add_argument("--dry-run", action="store_true", help="Show changes without applying")
+    f.add_argument("--backup-dir", help="Directory to store backups before changing permissions")
+    f.add_argument("--yes", "-y", action="store_true", help="Apply without prompting (use with care)")
+    f.add_argument("--json", action="store_true", dest="json_out", help="Output JSON")
+
+    args = parser.parse_args()
+
+    if args.command == "fix-permissions":
+        paths = args.path
+        res = fix_permissions(paths=paths, backup_dir=args.backup_dir, dry_run=args.dry_run)
+        if args.json_out:
+            print(_json.dumps(res, indent=2))
+        else:
+            for r in res:
+                print(f"{r['path']}: changed={r['changed']}, reason={r['reason']}, backup={r.get('backup')}, mode={r.get('current_mode')}")
+    else:
+        # default to discover
+        _print_discovered(json_out=(hasattr(args, 'json_out') and args.json_out))
 
 
 if __name__ == "__main__":
-    _print_discovered()
+    _main()
