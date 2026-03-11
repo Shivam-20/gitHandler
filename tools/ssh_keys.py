@@ -54,31 +54,29 @@ def validate_key(path: str) -> Dict:
 
     Returns a dict: {"path": str, "type": Optional[str], "permissions_ok": bool, "reason": str}
 
-    Reason is a human-readable explanation (OK or why validation failed).
+    This function avoids following symlinks: paths that are symlinks are rejected.
     """
     p = Path(path).expanduser()
     result = {"path": str(p), "type": None, "permissions_ok": False, "reason": ""}
 
-    # First, stat the file to obtain mode information (stat usually succeeds even when open would fail)
+    # Use lstat to detect symlinks and avoid following them.
     try:
-        st0 = p.stat()
+        lst = p.lstat()
     except PermissionError:
         result["reason"] = "Permission denied while accessing path"
+        return result
+    except FileNotFoundError:
+        result["reason"] = "File does not exist"
         return result
     except OSError as e:
         result["reason"] = f"OS error: {e}"
         return result
 
-    mode = stat.S_IMODE(st0.st_mode)
-    # Permissions are considered OK if owner has read, no group/other bits, and file is not executable
-    permissions_ok = (
-        (mode & (stat.S_IRWXG | stat.S_IRWXO)) == 0
-        and (mode & stat.S_IXUSR) == 0
-        and (mode & stat.S_IRUSR) != 0
-    )
-    result["permissions_ok"] = permissions_ok
+    if stat.S_ISLNK(lst.st_mode):
+        result["reason"] = "Path is a symlink; refusing to operate"
+        return result
 
-    # Attempt to open the file safely to read header. Use O_NOFOLLOW when available to avoid symlink attacks.
+    # Open the file without following symlinks when possible
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -86,7 +84,6 @@ def validate_key(path: str) -> Dict:
     try:
         fd = os.open(str(p), flags)
     except OSError as e:
-        # Could not open file (e.g., permission denied) — still return permissions_ok based on stat
         result["reason"] = f"Failed to open file: {e}"
         return result
 
@@ -97,19 +94,18 @@ def validate_key(path: str) -> Dict:
             result["reason"] = f"fstat failed: {e}"
             return result
 
-        # Ensure we opened a regular file
+        # Ensure this is a regular file
         if not stat.S_ISREG(st.st_mode):
             result["reason"] = "Not a regular file"
             return result
 
-        # Basic TOCTOU check: ensure inode/dev didn't change between stat and open
-        try:
-            if st0.st_ino != st.st_ino or st0.st_dev != st.st_dev:
-                result["reason"] = "File changed between stat and open"
-                return result
-        except AttributeError:
-            # Platforms without st_ino/st_dev: skip this check
-            pass
+        mode = stat.S_IMODE(st.st_mode)
+        permissions_ok = (
+            (mode & (stat.S_IRWXG | stat.S_IRWXO)) == 0
+            and (mode & stat.S_IXUSR) == 0
+            and (mode & stat.S_IRUSR) != 0
+        )
+        result["permissions_ok"] = permissions_ok
 
         # Read header from file descriptor
         try:
@@ -125,10 +121,7 @@ def validate_key(path: str) -> Dict:
         if ktype is None:
             result["reason"] = "No recognized private key header found"
         else:
-            if permissions_ok:
-                result["reason"] = "OK"
-            else:
-                result["reason"] = f"Permissions too open: {oct(mode)}"
+            result["reason"] = "OK" if permissions_ok else f"Permissions too open: {oct(mode)}"
         return result
     finally:
         try:
@@ -237,74 +230,111 @@ def _print_discovered(json_out: bool = False):
 def fix_permissions_for_file(pth: str, backup_dir: Optional[str] = None, dry_run: bool = True) -> Dict:
     """Attempt to make a single key's permissions secure (owner read/write only).
 
+    This function avoids following symlinks by using lstat and opening with O_NOFOLLOW
+    where available. Backups are created by reading from the opened file descriptor.
+
     Returns a dict with keys: path, changed (bool), current_mode, would_set_mode, backup (path or None), reason
     """
-    from shutil import copy2
+    from shutil import copyfileobj
     import time as _time
 
     p = Path(pth).expanduser()
     res = {"path": str(p), "changed": False, "current_mode": None, "would_set_mode": None, "backup": None, "reason": ""}
 
+    # Use lstat to detect symlinks and avoid following them
     try:
-        st = p.stat()
+        lst = p.lstat()
     except Exception as e:
         res["reason"] = f"Stat failed: {e}"
         return res
 
-    mode = stat.S_IMODE(st.st_mode)
-    res["current_mode"] = oct(mode)
-
-    secure_mode = 0o600
-    permissions_ok = (
-        (mode & (stat.S_IRWXG | stat.S_IRWXO)) == 0
-        and (mode & stat.S_IXUSR) == 0
-        and (mode & stat.S_IRUSR) != 0
-    )
-
-    if permissions_ok:
-        res["reason"] = "Already secure"
+    if stat.S_ISLNK(lst.st_mode):
+        res["reason"] = "Refusing to operate on symlink"
         return res
 
-    res["would_set_mode"] = oct(secure_mode)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
 
-    if dry_run:
-        res["reason"] = "Dry run"
-        return res
-
-    # Perform backup if requested
-    if backup_dir:
-        bdir = Path(backup_dir).expanduser()
-        try:
-            bdir.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            res["reason"] = f"Failed to create backup dir: {e}"
-            return res
-        bakname = f"{p.name}.{int(_time.time())}.bak"
-        bpath = bdir / bakname
-        try:
-            copy2(str(p), str(bpath))
-            res["backup"] = str(bpath)
-        except Exception as e:
-            res["reason"] = f"Backup failed: {e}"
-            return res
-
-    # Apply chmod
     try:
-        os.chmod(str(p), secure_mode)
+        fd = os.open(str(p), flags)
     except Exception as e:
-        res["reason"] = f"chmod failed: {e}"
+        res["reason"] = f"Failed to open file: {e}"
         return res
 
     try:
-        new_mode = stat.S_IMODE(p.stat().st_mode)
-    except Exception as e:
-        res["reason"] = f"Stat after chmod failed: {e}"
-        return res
+        st = os.fstat(fd)
+        mode = stat.S_IMODE(st.st_mode)
+        res["current_mode"] = oct(mode)
 
-    res["changed"] = new_mode != mode
-    res["current_mode"] = oct(new_mode)
-    res["reason"] = "Permissions updated" if res["changed"] else "Permissions unchanged"
-    return res
+        secure_mode = 0o600
+        permissions_ok = (
+            (mode & (stat.S_IRWXG | stat.S_IRWXO)) == 0
+            and (mode & stat.S_IXUSR) == 0
+            and (mode & stat.S_IRUSR) != 0
+        )
+
+        if permissions_ok:
+            res["reason"] = "Already secure"
+            return res
+
+        res["would_set_mode"] = oct(secure_mode)
+
+        if dry_run:
+            res["reason"] = "Dry run"
+            return res
+
+        # Perform backup if requested (read from the file descriptor to avoid symlink races)
+        if backup_dir:
+            bdir = Path(backup_dir).expanduser()
+            try:
+                bdir.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                res["reason"] = f"Failed to create backup dir: {e}"
+                return res
+            bakname = f"{p.name}.{int(_time.time())}.bak"
+            bpath = bdir / bakname
+            try:
+                rd_fd = os.dup(fd)
+                with os.fdopen(rd_fd, "rb") as src, open(bpath, "wb") as dst:
+                    copyfileobj(src, dst)
+                res["backup"] = str(bpath)
+            except Exception as e:
+                res["reason"] = f"Backup failed: {e}"
+                return res
+
+        # Apply permissions via fchmod when available to avoid following symlinks
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, secure_mode)
+            else:
+                # Fallback to chmod on the path after extra checks
+                if p.is_symlink():
+                    res["reason"] = "Refusing to chmod symlink"
+                    return res
+                os.chmod(str(p), secure_mode)
+        except Exception as e:
+            res["reason"] = f"chmod failed: {e}"
+            return res
+
+        try:
+            new_mode = stat.S_IMODE(os.fstat(fd).st_mode)
+        except Exception:
+            try:
+                new_mode = stat.S_IMODE(p.stat().st_mode)
+            except Exception as e:
+                res["reason"] = f"Stat after chmod failed: {e}"
+                return res
+
+        res["changed"] = new_mode != mode
+        res["current_mode"] = oct(new_mode)
+        res["reason"] = "Permissions updated" if res["changed"] else "Permissions unchanged"
+        return res
+    finally:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
 
 
 def fix_permissions(paths: Optional[list] = None, backup_dir: Optional[str] = None, dry_run: bool = True) -> List[Dict]:
