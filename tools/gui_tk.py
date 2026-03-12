@@ -86,6 +86,15 @@ _APP_CSS = """
 .diff-view {
     font-family: monospace;
 }
+.dim-label {
+    color: alpha(@theme_fg_color, 0.45);
+    font-size: 0.88em;
+}
+entry.commit-error {
+    border-color: #cc0000;
+    box-shadow: inset 0 0 0 1px #cc0000;
+    background-color: alpha(#cc0000, 0.05);
+}
 """
 
 # ── Recent repos ──────────────────────────────────────────────────────────────
@@ -635,12 +644,15 @@ class _GTKApp:
                 s.set_margin_start(4); s.set_margin_end(4)
                 bar.pack_start(s, False, False, 0)
             else:
-                label, style, cb = item
+                label, style, cb, *_tip = item
+                tooltip = _tip[0] if _tip else None
                 btn = Gtk.Button(label=label)
                 if style:
                     btn.get_style_context().add_class(style)
                 if cb:
                     btn.connect('clicked', lambda _, f=cb: f())
+                if tooltip:
+                    btn.set_tooltip_text(tooltip)
                 bar.pack_start(btn, False, False, 0)
         return bar
 
@@ -804,7 +816,7 @@ class _GTKApp:
     # ═══════════════════════════════════════════════════════════════════════════
     def _build_status_page(self) -> 'Gtk.Widget':
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        _state: Dict = {'staged': [], 'unstaged': [], 'mode': 'unstaged'}
+        _state: Dict = {'staged': [], 'unstaged': [], 'branch_lbl': None}
 
         STATUS_COLOR = {
             'M': C_ORANGE, 'A': C_GREEN, 'D': C_RED,
@@ -825,15 +837,8 @@ class _GTKApp:
 
         btn_refresh = Gtk.Button(label='↺ Refresh')
         btn_refresh.connect('clicked', lambda _: _refresh())
+        btn_refresh.set_tooltip_text('Reload working tree status from git')
         tb.pack_start(btn_refresh, False, False, 0)
-
-        staged_btn   = Gtk.ToggleButton(label='Staged')
-        unstaged_btn = Gtk.ToggleButton(label='Unstaged / Untracked')
-        unstaged_btn.set_active(True)
-        staged_btn.connect('toggled',   lambda b: _toggle('staged')   if b.get_active() else None)
-        unstaged_btn.connect('toggled', lambda b: _toggle('unstaged') if b.get_active() else None)
-        tb.pack_start(staged_btn, False, False, 0)
-        tb.pack_start(unstaged_btn, False, False, 0)
 
         # Paned: file list | diff
         paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
@@ -852,50 +857,63 @@ class _GTKApp:
         diff_scroll, diff_tv, diff_buf = _make_diff_view()
         paned.pack2(diff_scroll, resize=True, shrink=True)
 
-        def _toggle(mode: str):
-            _state['mode'] = mode
-            staged_btn.set_active(mode == 'staged')
-            unstaged_btn.set_active(mode == 'unstaged')
-            _populate_list()
+        def _make_file_row(code: str, filepath: str, is_staged: bool) -> 'Gtk.ListBoxRow':
+            row = Gtk.ListBoxRow()
+            row._fp = filepath
+            row._code = code
+            row._is_staged = is_staged
+            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            box.set_margin_start(8); box.set_margin_end(8)
+            box.set_margin_top(3);   box.set_margin_bottom(3)
+            dot_color = C_GREEN if is_staged else C_ORANGE
+            badge = Gtk.Label()
+            badge.set_markup(_markup(f'● {code}', dot_color))
+            badge.set_width_chars(5)
+            path_lbl = Gtk.Label(label=filepath)
+            path_lbl.set_xalign(0.0); path_lbl.set_hexpand(True)
+            path_lbl.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+            box.pack_start(badge, False, False, 0)
+            box.pack_start(path_lbl, True, True, 0)
+            row.add(box)
+            return row
+
+        def _section_row(text: str) -> 'Gtk.ListBoxRow':
+            row = Gtk.ListBoxRow()
+            row.set_selectable(False)
+            row.set_activatable(False)
+            lbl = Gtk.Label()
+            lbl.set_markup(f'<span foreground="{C_GRAY}"><b>  {text}</b></span>')
+            lbl.set_xalign(0.0)
+            lbl.set_margin_start(8); lbl.set_margin_top(6); lbl.set_margin_bottom(2)
+            row.add(lbl)
+            return row
 
         def _populate_list():
             for row in file_list.get_children():
                 file_list.remove(row)
-            items = _state[_state['mode']]
-            for code, filepath in items:
-                row = Gtk.ListBoxRow()
-                row._fp = filepath
-                row._code = code
-                box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-                box.set_margin_start(8); box.set_margin_end(8)
-                box.set_margin_top(4);   box.set_margin_bottom(4)
-                color = STATUS_COLOR.get(code.strip(), C_GRAY)
-                badge = Gtk.Label()
-                badge.set_markup(_markup(f' {code} ', color))
-                badge.set_width_chars(4)
-                path_lbl = Gtk.Label(label=filepath)
-                path_lbl.set_xalign(0.0); path_lbl.set_hexpand(True)
-                path_lbl.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
-                box.pack_start(badge, False, False, 0)
-                box.pack_start(path_lbl, True, True, 0)
-                row.add(box)
-                file_list.add(row)
+            file_list.add(_section_row('STAGED'))
+            for code, filepath in _state['staged']:
+                file_list.add(_make_file_row(code, filepath, True))
+            file_list.add(_section_row('UNSTAGED / UNTRACKED'))
+            for code, filepath in _state['unstaged']:
+                file_list.add(_make_file_row(code, filepath, False))
             file_list.show_all()
 
         def _on_file_select(lb, row):
-            if not row: return
+            if not row or not hasattr(row, '_fp'): return
             rd = self._repo_path
             if not rd: return
             fp = row._fp
-            mode = _state['mode']
+            is_staged = getattr(row, '_is_staged', False)
             def _do():
-                if mode == 'staged':
+                if is_staged:
                     r = _git(rd, 'diff', '--cached', '--', fp)
                 else:
                     r = _git(rd, 'diff', 'HEAD', '--', fp)
-                    if not r['stdout']:
+                    if not r['stdout'].strip():
                         r = _git(rd, 'diff', '--', fp)
-                GLib.idle_add(_apply_diff_colors, diff_buf, r['stdout'] or '(no diff)')
+                GLib.idle_add(_apply_diff_colors, diff_buf,
+                              r['stdout'] or '(no diff)')
             threading.Thread(target=_do, daemon=True).start()
 
         file_list.connect('row-selected', _on_file_select)
@@ -920,22 +938,10 @@ class _GTKApp:
                 _state['unstaged'] = unstaged
                 GLib.idle_add(_populate_list)
                 self.set_status(f'{len(staged)} staged, {len(unstaged)} unstaged', C_BLUE)
+                if _state.get('branch_lbl'):
+                    GLib.idle_add(_state['branch_lbl'].set_markup,
+                                  _markup(f'On branch: {self._current_branch or "?"}', C_GRAY))
             threading.Thread(target=_do, daemon=True).start()
-
-        # Commit area
-        outer.pack_start(self._sep(), False, False, 0)
-        commit_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        commit_box.set_margin_start(18); commit_box.set_margin_end(18)
-        commit_box.set_margin_top(8);    commit_box.set_margin_bottom(8)
-        outer.pack_start(commit_box, False, False, 0)
-
-        commit_entry = Gtk.Entry()
-        commit_entry.set_placeholder_text('Commit message…')
-        commit_entry.set_hexpand(True)
-        commit_box.pack_start(commit_entry, False, False, 0)
-
-        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        commit_box.pack_start(btn_row, False, False, 0)
 
         def _stage_selected():
             rd = self._repo_path
@@ -988,11 +994,73 @@ class _GTKApp:
                 GLib.idle_add(_refresh)
             threading.Thread(target=_do, daemon=True).start()
 
+        # Commit area
+        outer.pack_start(self._sep(), False, False, 0)
+        commit_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        commit_box.set_margin_start(18); commit_box.set_margin_end(18)
+        commit_box.set_margin_top(8);    commit_box.set_margin_bottom(8)
+        outer.pack_start(commit_box, False, False, 0)
+
+        # Metadata row: branch label + char counter
+        meta_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        commit_box.pack_start(meta_row, False, False, 0)
+        branch_lbl = Gtk.Label()
+        branch_lbl.set_markup(_markup(f'On branch: {self._current_branch or "?"}', C_GRAY))
+        branch_lbl.set_xalign(0.0)
+        branch_lbl.get_style_context().add_class('dim-label')
+        meta_row.pack_start(branch_lbl, True, True, 0)
+        _state['branch_lbl'] = branch_lbl
+        char_counter = Gtk.Label(label='0 chars')
+        char_counter.set_xalign(1.0)
+        char_counter.get_style_context().add_class('dim-label')
+        meta_row.pack_end(char_counter, False, False, 0)
+
+        commit_entry = Gtk.Entry()
+        commit_entry.set_placeholder_text('Commit message…')
+        commit_entry.set_hexpand(True)
+        commit_entry.connect('changed', lambda e: char_counter.set_label(
+            f'{len(e.get_text())} chars'))
+        commit_box.pack_start(commit_entry, False, False, 0)
+
+        # File-ops row
+        file_ops_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        file_ops_row.set_margin_top(4)
+        commit_box.pack_start(file_ops_row, False, False, 0)
+
+        def _make_btn(label, style=None, cb=None, tip=None):
+            b = Gtk.Button(label=label)
+            if style: b.get_style_context().add_class(style)
+            if cb:    b.connect('clicked', lambda _: cb())
+            if tip:   b.set_tooltip_text(tip)
+            return b
+
+        file_ops_row.pack_start(_make_btn(
+            'Stage Selected', None, _stage_selected,
+            'Add the selected file\'s changes to the staging area'), False, False, 0)
+        file_ops_row.pack_start(_make_btn(
+            'Unstage Selected', None, _unstage_selected,
+            'Remove the selected file from the staging area (keeps changes in working tree)'), False, False, 0)
+        file_ops_row.pack_start(_make_btn(
+            'Stage All', None, _stage_all,
+            'Stage every modified and untracked file at once (git add -A)'), False, False, 0)
+        file_ops_row.pack_start(_make_btn(
+            'Discard Selected', 'destructive-action', _discard_selected,
+            'Permanently revert the selected file to its last committed state — cannot be recovered'), False, False, 0)
+
+        # Commit-ops row
+        commit_ops_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        commit_ops_row.set_margin_top(2)
+        commit_box.pack_start(commit_ops_row, False, False, 0)
+
         def _commit():
             rd = self._repo_path
             if not rd: return
             msg = commit_entry.get_text().strip()
-            if not msg: _show_error(self._win, 'Commit message is required.'); return
+            if not msg:
+                commit_entry.get_style_context().add_class('commit-error')
+                self.set_status('Commit message is required', C_RED)
+                return
+            commit_entry.get_style_context().remove_class('commit-error')
             def _do():
                 r = _git(rd, 'commit', '-m', msg)
                 self.log(r['stdout'].strip() or r['stderr'].strip(),
@@ -1016,28 +1084,39 @@ class _GTKApp:
                 GLib.idle_add(_refresh)
             threading.Thread(target=_do, daemon=True).start()
 
-        for _item in [
-            ('Stage Selected',   None,               _stage_selected),
-            ('Unstage Selected', None,               _unstage_selected),
-            ('Stage All',        None,               _stage_all),
-            ('Discard Selected', 'destructive-action', _discard_selected),
-            None,
-            ('Commit',           'suggested-action', _commit),
-            ('Amend Last',       None,               _amend),
-        ]:
-            if _item is None:
-                label, style, cb = None, None, None
-            else:
-                label, style, cb = _item
-            if label is None:
-                s = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
-                s.set_margin_start(4); s.set_margin_end(4)
-                btn_row.pack_start(s, False, False, 0)
-            else:
-                b = Gtk.Button(label=label)
-                if style: b.get_style_context().add_class(style)
-                b.connect('clicked', lambda _, f=cb: f())
-                btn_row.pack_start(b, False, False, 0)
+        def _stage_all_and_commit():
+            rd = self._repo_path
+            if not rd: return
+            msg = commit_entry.get_text().strip()
+            if not msg:
+                commit_entry.get_style_context().add_class('commit-error')
+                self.set_status('Commit message is required', C_RED)
+                return
+            commit_entry.get_style_context().remove_class('commit-error')
+            def _do():
+                r1 = _git(rd, 'add', '-A')
+                if r1['returncode'] != 0:
+                    self.log(r1['stderr'].strip(), 'err')
+                    return
+                r2 = _git(rd, 'commit', '-m', msg)
+                self.log(r2['stdout'].strip() or r2['stderr'].strip(),
+                         'ok' if r2['returncode'] == 0 else 'err')
+                if r2['returncode'] == 0:
+                    GLib.idle_add(commit_entry.set_text, '')
+                GLib.idle_add(_refresh)
+            threading.Thread(target=_do, daemon=True).start()
+
+        commit_entry.connect('activate', lambda _: _commit())
+
+        commit_ops_row.pack_start(_make_btn(
+            'Commit', 'suggested-action', _commit,
+            'Create a new commit from staged files using the message above'), False, False, 0)
+        commit_ops_row.pack_start(_make_btn(
+            'Amend Last', None, _amend,
+            'Rewrite the most recent commit — use with care on already-pushed commits'), False, False, 0)
+        commit_ops_row.pack_start(_make_btn(
+            'Stage All & Commit', 'suggested-action', _stage_all_and_commit,
+            'Stage every change and commit immediately — fast path for simple single-task changes'), False, False, 0)
 
         self._page_reload_callbacks['status'] = _refresh
         return outer
@@ -1195,6 +1274,15 @@ class _GTKApp:
                 clip.set_text(h, -1)
                 self.log(f'Copied: {h}', 'dim')
 
+        _LOG_TIPS = {
+            'Revert Commit': 'Create a new commit that undoes the selected commit\'s changes',
+            'Reset Soft':    'Move HEAD back to the selected commit, keeping all changes staged',
+            'Reset Mixed':   'Move HEAD back, keeping changes unstaged in the working tree',
+            'Reset Hard':    'Move HEAD back and discard ALL changes — this cannot be undone',
+            'Cherry-pick':   'Apply the selected commit\'s changes onto the current branch as a new commit',
+            'Tag':           'Create a lightweight tag pointing at the selected commit',
+            'Copy Hash':     'Copy the full commit hash to the clipboard',
+        }
         for _item in [
             ('Revert Commit',  None,                 _revert),
             None,
@@ -1207,17 +1295,16 @@ class _GTKApp:
             ('Copy Hash',      None,                 _copy_hash),
         ]:
             if _item is None:
-                label, style, cb = None, None, None
-            else:
-                label, style, cb = _item
-            if label is None:
                 s = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
                 s.set_margin_start(4); s.set_margin_end(4)
                 act.pack_start(s, False, False, 0)
             else:
+                label, style, cb = _item
                 b = Gtk.Button(label=label)
                 if style: b.get_style_context().add_class(style)
                 b.connect('clicked', lambda _, f=cb: f())
+                if label in _LOG_TIPS:
+                    b.set_tooltip_text(_LOG_TIPS[label])
                 act.pack_start(b, False, False, 0)
 
         self._page_reload_callbacks['log'] = _refresh
@@ -1286,27 +1373,58 @@ class _GTKApp:
         stash_lbl.set_markup('<b>Stashes</b>')
         stash_lbl.set_hexpand(True); stash_lbl.set_xalign(0.0)
         stash_tb.pack_start(stash_lbl, True, True, 0)
+        stash_refresh_btn = Gtk.Button(label='↺')
+        stash_refresh_btn.set_tooltip_text('Refresh stash list')
+        stash_tb.pack_start(stash_refresh_btn, False, False, 0)
 
-        stash_store = Gtk.ListStore(str, str, str)  # ref, message, color
+        stash_hint = Gtk.Label(label='Stash saves uncommitted changes temporarily so you can switch tasks.')
+        stash_hint.set_xalign(0.0)
+        stash_hint.set_margin_start(18); stash_hint.set_margin_end(18)
+        stash_hint.set_margin_bottom(4)
+        stash_hint.get_style_context().add_class('dim-label')
+        inner.pack_start(stash_hint, False, False, 0)
+
+        stash_store = Gtk.ListStore(str, str, str, str)  # ref, date, message, color
         stash_tree = Gtk.TreeView(model=stash_store)
         stash_tree.set_headers_visible(True)
         stash_tree.get_selection().set_mode(Gtk.SelectionMode.SINGLE)
-        for i, (title, width) in enumerate([('Stash Ref', 100), ('Message', 400)]):
+        for i, (title, width, stretch) in enumerate([
+            ('Ref', 90, False), ('Date', 120, False), ('Message', 340, True)
+        ]):
             r = Gtk.CellRendererText()
             r.set_property('ellipsize', Pango.EllipsizeMode.END)
-            col = Gtk.TreeViewColumn(title, r, text=i, foreground=2)
-            col.set_min_width(width); col.set_resizable(True)
+            col = Gtk.TreeViewColumn(title, r, text=i, foreground=3)
+            col.set_min_width(width); col.set_resizable(True); col.set_expand(stretch)
             stash_tree.append_column(col)
 
         stash_scroll = Gtk.ScrolledWindow()
         stash_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         stash_scroll.set_min_content_height(100)
         stash_scroll.add(stash_tree)
+        stash_diff_scroll, stash_diff_tv, stash_diff_buf = _make_diff_view()
+        stash_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        stash_paned.set_position(380)
+        stash_paned.pack1(stash_scroll, resize=False, shrink=False)
+        stash_paned.pack2(stash_diff_scroll, resize=True, shrink=True)
+
         stash_frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         stash_frame.set_margin_start(18); stash_frame.set_margin_end(18)
         stash_frame.set_margin_bottom(8)
-        stash_frame.pack_start(stash_scroll, True, True, 0)
+        stash_frame.pack_start(stash_paned, True, True, 0)
         inner.pack_start(stash_frame, False, False, 0)
+
+        def _on_stash_select(sel):
+            model, it = sel.get_selected()
+            if not it: return
+            ref = model.get_value(it, 0)
+            rd = self._repo_path
+            if not rd: return
+            def _do():
+                r = _git(rd, 'stash', 'show', '-p', ref)
+                GLib.idle_add(_apply_diff_colors, stash_diff_buf,
+                              r['stdout'] or '(empty stash)')
+            threading.Thread(target=_do, daemon=True).start()
+        stash_tree.get_selection().connect('changed', _on_stash_select)
 
         def _refresh():
             rd = self._repo_path
@@ -1327,11 +1445,12 @@ class _GTKApp:
                 store.append([b, loc, note, color, weight])
             # Stash
             stash_store.clear()
-            sr = _git(rd, 'stash', 'list')
+            sr = _git(rd, 'stash', 'list', '--format=%gd|%ci|%s')
             for line in sr['stdout'].splitlines():
-                if ':' in line:
-                    ref, rest = line.split(':', 1)
-                    stash_store.append([ref.strip(), rest.strip(), C_ORANGE])
+                parts = line.split('|', 2)
+                if len(parts) == 3:
+                    ref, date, message = parts
+                    stash_store.append([ref.strip(), date.strip()[:10], message.strip(), C_ORANGE])
 
         def _get_branch() -> Optional[str]:
             return self._get_selected_value(tree, 0)
@@ -1439,8 +1558,16 @@ class _GTKApp:
             threading.Thread(target=_do, daemon=True).start()
 
         def _stash_action(action: str):
-            rd = self._require_repo(); ref = _get_stash_ref()
-            if not rd or not ref: return
+            rd = self._repo_path
+            if not rd: return
+            ref = _get_stash_ref()
+            if not ref:
+                self.set_status(f'Select a stash entry before {action}', C_ORANGE)
+                return
+            if action == 'drop':
+                if not _ask_yes_no(self._win, f'Drop {ref}?',
+                                   'This permanently deletes the stash entry and cannot be undone.'):
+                    return
             def _do():
                 r = _git(rd, 'stash', action, ref)
                 self.log(r['stdout'].strip() or r['stderr'].strip(),
@@ -1448,30 +1575,64 @@ class _GTKApp:
                 GLib.idle_add(_refresh)
             threading.Thread(target=_do, daemon=True).start()
 
+        def _stash_refresh():
+            rd = self._repo_path
+            if not rd: return
+            def _do():
+                stash_store.clear()
+                sr = _git(rd, 'stash', 'list', '--format=%gd|%ci|%s')
+                for line in sr['stdout'].splitlines():
+                    parts = line.split('|', 2)
+                    if len(parts) == 3:
+                        ref, date, message = parts
+                        GLib.idle_add(stash_store.append,
+                                      [ref.strip(), date.strip()[:10], message.strip(), C_ORANGE])
+            threading.Thread(target=_do, daemon=True).start()
+        stash_refresh_btn.connect('clicked', lambda _: _stash_refresh())
+
         tree.connect('row-activated', lambda *_: _checkout())
+
+        def _on_branch_key(widget, event):
+            if event.keyval == Gdk.KEY_Delete:
+                _delete_branch()
+                return True
+            return False
+        tree.connect('key-press-event', _on_branch_key)
+
         outer.pack_start(self._sep(), False, False, 0)
 
         # Branch actions
         branch_act = self._action_bar(
-            ('Checkout',        'suggested-action',   _checkout),
-            ('New Branch',      None,                 _new_branch),
-            ('Delete',          'destructive-action', _delete_branch),
+            ('Checkout',        'suggested-action',   _checkout,
+             'Switch your working tree to the selected branch'),
+            ('New Branch',      None,                 _new_branch,
+             'Create a new branch, optionally checking it out immediately'),
+            ('Delete',          'destructive-action', _delete_branch,
+             'Delete the selected branch — prompts for force-delete if unmerged'),
             None,
-            ('Pull',            None,                 _pull),
-            ('Push',            None,                 lambda: _push(False)),
-            ('Push (upstream)', None,                 lambda: _push(True)),
+            ('Pull',            None,                 _pull,
+             'Fetch and merge changes from the upstream tracking branch'),
+            ('Push',            None,                 lambda: _push(False),
+             'Push the current branch to a remote — you will be prompted for the remote name'),
+            ('Push (upstream)', None,                 lambda: _push(True),
+             'Push and set the remote tracking reference with --set-upstream'),
             None,
-            ('Fetch All',       None,                 _fetch_all),
+            ('Fetch All',       None,                 _fetch_all,
+             'Download all objects from all remotes and prune deleted remote branches'),
         )
         outer.pack_start(branch_act, False, False, 0)
         outer.pack_start(self._sep(), False, False, 0)
 
         # Stash actions
         stash_act = self._action_bar(
-            ('Stash Push',  None, _stash_push),
-            ('Pop',         None, lambda: _stash_action('pop')),
-            ('Apply',       None, lambda: _stash_action('apply')),
-            ('Drop',        'destructive-action', lambda: _stash_action('drop')),
+            ('Stash Push', None, _stash_push,
+             'Save all uncommitted changes onto the stash stack so your working tree becomes clean'),
+            ('Pop',        None, lambda: _stash_action('pop'),
+             'Apply the selected stash and remove it from the stack'),
+            ('Apply',      None, lambda: _stash_action('apply'),
+             'Apply the selected stash without removing it from the stack'),
+            ('Drop',       'destructive-action', lambda: _stash_action('drop'),
+             'Permanently delete the selected stash entry — this cannot be undone'),
         )
         outer.pack_start(stash_act, False, False, 0)
 
@@ -1827,14 +1988,19 @@ class _GTKApp:
 
         outer.pack_start(self._sep(), False, False, 0)
         outer.pack_start(self._action_bar(
-            ('Update to SSH',   'suggested-action',   _update_ssh),
-            ('Add Remote',      None,                 _add_remote),
-            ('Remove',          'destructive-action', _remove_remote),
-            ('Rename',          None,                 _rename_remote),
-            ('Set URL',         None,                 _set_url),
+            ('Update to SSH',   'suggested-action',   _update_ssh,
+             'Rewrite remote URLs to use the chosen SSH key alias'),
+            ('Add Remote',      None,                 _add_remote,
+             'Register a new named remote URL'),
+            ('Remove',          'destructive-action', _remove_remote,
+             'Delete the selected remote from the repository configuration'),
+            ('Rename',          None,                 _rename_remote,
+             'Give the selected remote a new name'),
+            ('Set URL',         None,                 _set_url,
+             'Change the URL of the selected remote'),
             None,
-            ('Fetch Selected',  None,                 lambda: _fetch(True)),
-            ('Fetch All',       None,                 lambda: _fetch(False)),
+            ('Fetch All',       None,                 _fetch,
+             'Download new objects from every configured remote'),
         ), False, False, 0)
 
         self._page_reload_callbacks['remotes'] = _refresh
@@ -1991,13 +2157,19 @@ class _GTKApp:
 
         outer.pack_start(self._sep(), False, False, 0)
         outer.pack_start(self._action_bar(
-            ('Open Folder',  None,                 _open_fm),
-            ('Add Worktree', 'suggested-action',   _add_worktree),
-            ('Remove',       'destructive-action', _remove_worktree),
+            ('Open Folder',  None,                 _open_fm,
+             'Open the selected worktree directory in the system file manager'),
+            ('Add Worktree', 'suggested-action',   _add_worktree,
+             'Create a new linked worktree at a specified path, on an existing or new branch'),
+            ('Remove',       'destructive-action', _remove_worktree,
+             'Delete the selected linked worktree (the main worktree cannot be removed)'),
             None,
-            ('Lock',         None,                 _lock_worktree),
-            ('Unlock',       None,                 _unlock_worktree),
-            ('Prune',        None,                 _prune),
+            ('Lock',         None,                 _lock_worktree,
+             'Mark the selected worktree as locked to prevent automatic pruning'),
+            ('Unlock',       None,                 _unlock_worktree,
+             'Remove the lock from the selected worktree'),
+            ('Prune',        None,                 _prune,
+             'Clean up stale worktree files for worktrees no longer on disk'),
         ), False, False, 0)
 
         self._page_reload_callbacks['worktrees'] = _refresh
@@ -2127,11 +2299,15 @@ class _GTKApp:
 
         outer.pack_start(self._sep(), False, False, 0)
         outer.pack_start(self._action_bar(
-            ('Fix Selected',      None,                 _fix_sel),
-            ('Fix All',           None,                 _fix_all),
+            ('Fix Selected',      None,                 _fix_sel,
+             'Correct the file permissions of the selected SSH key to 600 (required by SSH)'),
+            ('Fix All',           None,                 _fix_all,
+             'Fix permissions on every key that currently has incorrect permissions'),
             None,
-            ('Add to Agent',      'suggested-action',   _add_agent),
-            ('Remove from Agent', 'destructive-action', _remove_agent),
+            ('Add to Agent',      'suggested-action',   _add_agent,
+             'Load the selected SSH key into the running ssh-agent for passwordless use'),
+            ('Remove from Agent', 'destructive-action', _remove_agent,
+             'Unload the selected SSH key from the ssh-agent'),
         ), False, False, 0)
 
         self._page_reload_callbacks['keys'] = _refresh
