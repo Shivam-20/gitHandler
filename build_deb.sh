@@ -10,10 +10,11 @@ PKG_NAME="git-ssh-helper"
 VERSION="0.1.0"
 ARCH="all"
 MAINTAINER="Maintainer <maintainer@example.com>"
-DESCRIPTION="Helper to clone git repos using selected SSH private keys (GUI/TUI/CLI)"
-LONG_DESC="git-ssh-helper discovers SSH private keys in ~/.ssh, lets you select one,
- and performs git clone via GIT_SSH_COMMAND so you don't have to touch ssh-agent or
- ~/.ssh/config manually. Includes a Tkinter GUI, a curses TUI, and a plain CLI."
+DESCRIPTION="SSH Git Manager — GTK GUI for managing git repos, SSH keys and remotes"
+LONG_DESC="SSH Git Manager (git-ssh-helper) provides a GTK 3 graphical interface for
+ cloning repositories with chosen SSH keys, managing branches, remotes, worktrees,
+ stashes, commit history, merge/rebase operations, and SSH key permissions. It also
+ offers a CLI for scripting and a TUI fallback for headless environments."
 
 OUTPUT_DIR="${SCRIPT_DIR}"
 
@@ -35,7 +36,8 @@ done
 # ── check requirements ────────────────────────────────────────────────────────
 command -v dpkg-deb >/dev/null 2>&1 || die "dpkg-deb not found. Install: sudo apt install dpkg"
 command -v python3  >/dev/null 2>&1 || die "python3 not found"
-python3 -m pip --version >/dev/null 2>&1 || die "pip not found: sudo apt install python3-pip"
+command -v pip3     >/dev/null 2>&1 || python3 -c "import pip" 2>/dev/null \
+    || die "pip not found: sudo apt install python3-pip"
 command -v fakeroot >/dev/null 2>&1 || warn "fakeroot not found — package may have wrong file ownership (install: sudo apt install fakeroot)"
 
 DEB_FILE="${OUTPUT_DIR}/${PKG_NAME}_${VERSION}_${ARCH}.deb"
@@ -59,10 +61,14 @@ mkdir -p \
 
 # ── install Python package into lib dir ───────────────────────────────────────
 info "Installing Python files..."
+# --break-system-packages: required on PEP-668 systems (Ubuntu 22.04+) when
+# running pip outside a venv.  We're installing to a custom --target so this
+# is safe — nothing system-wide is modified.
 python3 -m pip install \
     --target "$PKG_ROOT/usr/lib/git-ssh-helper" \
     --no-compile \
     --no-deps \
+    --break-system-packages \
     "$SCRIPT_DIR" \
     --quiet
 
@@ -157,8 +163,8 @@ Version: $VERSION
 Architecture: $ARCH
 Maintainer: $MAINTAINER
 Installed-Size: $INSTALLED_SIZE
-Depends: python3 (>= 3.8), git, openssh-client
-Recommends: python3-tk, librsvg2-bin
+Depends: python3 (>= 3.8), git, openssh-client, python3-gi, python3-gi-cairo, gir1.2-gtk-3.0
+Recommends: librsvg2-bin
 Section: devel
 Priority: optional
 Homepage: https://github.com/example/git-ssh-helper

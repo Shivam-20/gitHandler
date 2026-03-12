@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# install.sh — install git-ssh-helper on a local system
+# install.sh — install SSH Git Manager (git-ssh-helper) on a local system
 #
 # Usage:
 #   ./install.sh              # user install (no root required)
 #   sudo ./install.sh         # system-wide install
-#   ./install.sh --uninstall  # remove
+#   ./install.sh --uninstall  # remove everything
 #
 # Install methods tried in order (user mode):
-#   1. pipx  (recommended for CLI apps on PEP-668 systems)
-#   2. venv  (~/.local/lib/git-ssh-helper-venv) + wrapper in ~/.local/bin
+#   1. pipx  --system-site-packages  (recommended for PEP-668 systems)
+#   2. venv  --system-site-packages  (~/.local/lib/git-ssh-helper-venv)
 #
 # Install methods tried in order (root/system mode):
-#   1. venv  (/opt/git-ssh-helper-venv) + wrapper in /usr/local/bin
+#   1. venv  --system-site-packages  (/opt/git-ssh-helper-venv)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -99,8 +99,10 @@ do_uninstall() {
 # ── install via pipx (user only) ──────────────────────────────────────────────
 try_pipx() {
     command -v pipx >/dev/null 2>&1 || return 1
-    info "pipx found — using pipx install"
-    pipx install "$SCRIPT_DIR" --force
+    info "pipx found — using pipx install (--system-site-packages for python3-gi)"
+    # --system-site-packages is required so the pipx venv can import python3-gi
+    # which is a system package not available on PyPI.
+    pipx install "$SCRIPT_DIR" --force --system-site-packages
     ok "Installed via pipx"
     return 0
 }
@@ -118,7 +120,8 @@ install_venv() {
     fi
 
     info "Creating venv at $venv_dir..."
-    python3 -m venv "$venv_dir" \
+    # --system-site-packages lets the venv access python3-gi (not on PyPI)
+    python3 -m venv --system-site-packages "$venv_dir" \
         || die "python3-venv not available. Install: sudo apt install python3-venv python3-full"
 
     info "Installing package into venv..."
@@ -183,7 +186,6 @@ install_icon() {
         command -v gtk-update-icon-cache >/dev/null 2>&1 \
             && gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
     else
-        local xdg_data="${XDG_DATA_HOME:-$HOME/.local/share}"
         command -v gtk-update-icon-cache >/dev/null 2>&1 \
             && gtk-update-icon-cache -f -t "$USER_DATA_DIR/icons/hicolor" 2>/dev/null || true
     fi
@@ -248,10 +250,10 @@ main() {
     echo ""
     ok "Installation complete!"
     echo ""
-    echo "  Run:  git-ssh-helper --ui         (GUI/TUI mode)"
-    echo "  Run:  git-ssh-helper --list-keys   (list SSH keys)"
-    echo "  Run:  git-ssh-helper --help        (all options)"
-    echo "  Uninstall: ./install.sh --uninstall"
+    echo "  Run:       git-ssh-helper --ui         (GTK GUI)"
+    echo "  Run:       git-ssh-helper --list-keys  (list SSH keys)"
+    echo "  Run:       git-ssh-helper --help       (all options)"
+    echo "  Uninstall: ./uninstall.sh  (or ./install.sh --uninstall)"
     echo ""
 }
 
