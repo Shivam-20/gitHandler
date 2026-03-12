@@ -429,6 +429,7 @@ class _GTKApp:
         (None,           'status',      'Status',        'dialog-information-symbolic'),
         ('HISTORY',      None,          None,            None),
         (None,           'log',         'Log & Commits', 'document-open-recent-symbolic'),
+        (None,           'commits',     'Commits',       'edit-undo-symbolic'),
         ('BRANCHES',     None,          None,            None),
         (None,           'branches',    'Branches',      'vcs-branch-symbolic'),
         (None,           'merge',       'Merge / Rebase','media-playlist-shuffle-symbolic'),
@@ -520,6 +521,7 @@ class _GTKApp:
             ('clone',     self._build_clone_page),
             ('status',    self._build_status_page),
             ('log',       self._build_log_page),
+            ('commits',   self._build_commits_page),
             ('branches',  self._build_branch_page),
             ('merge',     self._build_merge_page),
             ('remotes',   self._build_remote_page),
@@ -1234,20 +1236,44 @@ class _GTKApp:
         tb.pack_start(lbl, True, True, 0)
 
         limit_entry = Gtk.Entry()
-        limit_entry.set_text('200')
+        limit_entry.set_text('500')
         limit_entry.set_width_chars(6)
         limit_entry.set_placeholder_text('limit')
         tb.pack_start(Gtk.Label(label='Show:'), False, False, 0)
         tb.pack_start(limit_entry, False, False, 0)
+        log_load_all_chk = Gtk.CheckButton(label='All')
+        log_load_all_chk.set_tooltip_text('Load all commits (may be slow)')
+
+        def _on_log_all_toggled(chk):
+            limit_entry.set_sensitive(not chk.get_active())
+
+        log_load_all_chk.connect('toggled', _on_log_all_toggled)
+        tb.pack_start(log_load_all_chk, False, False, 0)
         btn_ref = Gtk.Button(label='↺ Refresh')
         btn_ref.connect('clicked', lambda _: _refresh())
         tb.pack_start(btn_ref, False, False, 0)
+
+        # Search row
+        log_search_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        log_search_row.set_margin_start(18); log_search_row.set_margin_end(18)
+        log_search_row.set_margin_bottom(6)
+        outer.pack_start(log_search_row, False, False, 0)
+        log_search_row.pack_start(Gtk.Label(label='🔍 Search:'), False, False, 0)
+        log_search_entry = Gtk.Entry()
+        log_search_entry.set_placeholder_text('Filter by hash, author, or message…')
+        log_search_entry.set_hexpand(True)
+        log_search_row.pack_start(log_search_entry, True, True, 0)
+        btn_log_clear = Gtk.Button(label='✕')
+        btn_log_clear.set_tooltip_text('Clear search')
+        btn_log_clear.connect('clicked', lambda _: log_search_entry.set_text(''))
+        log_search_row.pack_start(btn_log_clear, False, False, 0)
 
         paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         paned.set_position(480)
         outer.pack_start(paned, True, True, 0)
 
         # Commit list — store: full_hash, short_hash, author, date, subject, color
+        _log_all_rows: List[list] = []
         store = Gtk.ListStore(str, str, str, str, str, str)
         tree = Gtk.TreeView(model=store)
         tree.set_headers_visible(True)
@@ -1270,14 +1296,43 @@ class _GTKApp:
         diff_scroll, _diff_tv, diff_buf = _make_diff_view()
         paned.pack2(diff_scroll, resize=True, shrink=True)
 
+        def _log_apply_filter(*_):
+            q = log_search_entry.get_text().strip().lower()
+            rows = _log_all_rows if not q else [
+                row for row in _log_all_rows
+                if q in row[1].lower() or q in row[2].lower() or q in row[4].lower()
+            ]
+            CHUNK = 500
+            total = len(rows)
+            tree.set_model(None)
+            store.clear()
+
+            def _chunk(start):
+                end = min(start + CHUNK, total)
+                for row in rows[start:end]:
+                    store.append(row)
+                if end < total:
+                    GLib.idle_add(_chunk, end)
+                else:
+                    tree.set_model(store)
+                    self.set_status(f'{total} commits shown', C_BLUE)
+                return False
+
+            GLib.idle_add(_chunk, 0)
+
+        log_search_entry.connect('changed', _log_apply_filter)
+
         def _refresh():
             rd = self._repo_path
             if not rd: return
-            limit = limit_entry.get_text().strip() or '200'
+            load_all = log_load_all_chk.get_active()
+            limit = limit_entry.get_text().strip() or '500'
+            btn_ref.set_sensitive(False)
             def _do():
-                r = _git(rd, 'log',
-                         f'--format=%H\x1f%an\x1f%ad\x1f%s',
-                         '--date=short', f'-{limit}')
+                cmd = ['log', f'--format=%H\x1f%an\x1f%ad\x1f%s', '--date=short']
+                if not load_all:
+                    cmd.append(f'-{limit}')
+                r = _git(rd, *cmd)
                 rows = []
                 for line in r['stdout'].splitlines():
                     parts = line.split('\x1f', 3)
@@ -1285,11 +1340,12 @@ class _GTKApp:
                         full, author, date, subject = parts
                         rows.append([full, full[:8], author, date, subject, '#cdd6f4'])
                 def _populate():
-                    store.clear()
-                    for row in rows:
-                        store.append(row)
+                    nonlocal _log_all_rows
+                    _log_all_rows[:] = rows
+                    btn_ref.set_sensitive(True)
+                    self.set_status(f'{len(rows)} commits loaded', C_BLUE)
+                    _log_apply_filter()
                 GLib.idle_add(_populate)
-                self.set_status(f'{len(rows)} commits loaded', C_BLUE)
             threading.Thread(target=_do, daemon=True).start()
 
         def _on_select(_sel):
@@ -1526,28 +1582,42 @@ class _GTKApp:
         def _refresh():
             rd = self._repo_path
             if not rd: return
-            cur = _git(rd, 'rev-parse', '--abbrev-ref', 'HEAD').get('stdout', '').strip()
-            _state['current'] = cur
-            store.clear()
-            r = _git(rd, 'branch', '-a', '--format=%(refname:short)')
-            for raw in r['stdout'].splitlines():
-                b = raw.strip().removeprefix('remotes/')
-                if not b or b.startswith('HEAD'): continue
-                is_remote = '/' in b
-                if is_remote and not show_remote.get_active(): continue
-                loc   = 'remote' if is_remote else 'local'
-                note  = '● current' if b == cur else ''
-                color = C_GREEN if b == cur else (C_GRAY if is_remote else '#cdd6f4')
-                weight = Pango.Weight.BOLD if b == cur else Pango.Weight.NORMAL
-                store.append([b, loc, note, color, weight])
-            # Stash
-            stash_store.clear()
-            sr = _git(rd, 'stash', 'list', '--format=%gd|%ci|%s')
-            for line in sr['stdout'].splitlines():
-                parts = line.split('|', 2)
-                if len(parts) == 3:
-                    ref, date, message = parts
-                    stash_store.append([ref.strip(), date.strip()[:10], message.strip(), C_ORANGE])
+
+            def _do():
+                cur = _git(rd, 'rev-parse', '--abbrev-ref', 'HEAD').get('stdout', '').strip()
+                _state['current'] = cur
+                r = _git(rd, 'branch', '-a', '--format=%(refname:short)')
+                rows = []
+                show_rem = show_remote.get_active()
+                for raw in r['stdout'].splitlines():
+                    b = raw.strip().removeprefix('remotes/')
+                    if not b or b.startswith('HEAD'): continue
+                    is_remote = '/' in b
+                    if is_remote and not show_rem: continue
+                    loc    = 'remote' if is_remote else 'local'
+                    note   = '● current' if b == cur else ''
+                    color  = C_GREEN if b == cur else (C_GRAY if is_remote else '#cdd6f4')
+                    weight = Pango.Weight.BOLD if b == cur else Pango.Weight.NORMAL
+                    rows.append([b, loc, note, color, weight])
+                sr = _git(rd, 'stash', 'list', '--format=%gd|%ci|%s')
+                stash_rows = []
+                for line in sr['stdout'].splitlines():
+                    parts = line.split('|', 2)
+                    if len(parts) == 3:
+                        ref, date, message = parts
+                        stash_rows.append([ref.strip(), date.strip()[:10], message.strip(), C_ORANGE])
+
+                def _populate():
+                    store.clear()
+                    for row in rows:
+                        store.append(row)
+                    stash_store.clear()
+                    for row in stash_rows:
+                        stash_store.append(row)
+
+                GLib.idle_add(_populate)
+
+            threading.Thread(target=_do, daemon=True).start()
 
         def _get_branch() -> Optional[str]:
             return self._get_selected_value(tree, 0)
@@ -1796,6 +1866,7 @@ class _GTKApp:
             if style: b.get_style_context().add_class(style)
             rebase_btn_row.pack_start(b, False, False, 0)
 
+
         # ── Cherry-pick / other ───────────────────────────────────────────────
         body.pack_start(self._sep(), False, False, 0)
         body.pack_start(self._section_label('Other'), False, False, 0)
@@ -1814,14 +1885,25 @@ class _GTKApp:
         def _populate_branches():
             rd = self._repo_path
             if not rd: return
-            r = _git(rd, 'branch', '-a', '--format=%(refname:short)')
-            for combo in (merge_combo, rebase_combo):
-                combo.remove_all()
-                for b in r['stdout'].splitlines():
-                    b = b.strip().removeprefix('remotes/')
-                    if b and not b.startswith('HEAD'):
-                        combo.append_text(b)
-                combo.set_active(0)
+
+            def _do():
+                r = _git(rd, 'branch', '-a', '--format=%(refname:short)')
+                branches = [
+                    b.strip().removeprefix('remotes/')
+                    for b in r['stdout'].splitlines()
+                    if b.strip() and not b.strip().removeprefix('remotes/').startswith('HEAD')
+                ]
+
+                def _apply():
+                    for combo in (merge_combo, rebase_combo):
+                        combo.remove_all()
+                        for b in branches:
+                            combo.append_text(b)
+                        combo.set_active(0)
+
+                GLib.idle_add(_apply)
+
+            threading.Thread(target=_do, daemon=True).start()
 
         def _do_merge():
             rd = self._require_repo()
@@ -1919,6 +2001,340 @@ class _GTKApp:
         self._page_reload_callbacks['merge'] = _populate_branches
         return scroll
 
+    # ═════════════════════════════════════════════════════════════════════════════
+    # Page: Commits (Selective Revert)
+    # ═════════════════════════════════════════════════════════════════════════════
+    def _build_commits_page(self) -> 'Gtk.Widget':
+        scroll, body = self._scrolled_body()
+
+        body.pack_start(self._section_label('Selective Revert'), False, False, 0)
+        body.pack_start(self._sep(), False, False, 0)
+
+        # Branch / ref selector row
+        revert_top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        body.pack_start(revert_top, False, False, 0)
+
+        revert_top.pack_start(Gtk.Label(label='Branch / ref:'), False, False, 0)
+        revert_combo = Gtk.ComboBoxText()
+        revert_combo.set_hexpand(True)
+        revert_top.pack_start(revert_combo, True, True, 0)
+
+        revert_count_spin = Gtk.SpinButton.new_with_range(10, 10000, 10)
+        revert_count_spin.set_value(100)
+        revert_count_spin.set_tooltip_text('Max commits to load (0 = load all)')
+        revert_top.pack_start(revert_count_spin, False, False, 0)
+
+        load_all_chk = Gtk.CheckButton(label='All')
+        load_all_chk.set_tooltip_text('Load every commit (may be slow for large repos)')
+
+        def _on_load_all_toggled(chk):
+            revert_count_spin.set_sensitive(not chk.get_active())
+
+        load_all_chk.connect('toggled', _on_load_all_toggled)
+        revert_top.pack_start(load_all_chk, False, False, 0)
+
+        btn_load_commits = Gtk.Button(label='Load Commits')
+        btn_load_commits.get_style_context().add_class('suggested-action')
+        revert_top.pack_start(btn_load_commits, False, False, 0)
+
+        # ── Search / filter row ────────────────────────────────────────────────────
+        search_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        body.pack_start(search_row, False, False, 0)
+
+        search_row.pack_start(Gtk.Label(label='🔍 Filter:'), False, False, 0)
+
+        search_mode = Gtk.ComboBoxText()
+        for m in ('All Fields', 'Author', 'Message', 'Hash', 'PR #'):
+            search_mode.append_text(m)
+        search_mode.set_active(0)
+        search_row.pack_start(search_mode, False, False, 0)
+
+        search_entry = Gtk.Entry()
+        search_entry.set_placeholder_text('Type to filter commits…')
+        search_entry.set_hexpand(True)
+        search_row.pack_start(search_entry, True, True, 0)
+
+        btn_clear_search = Gtk.Button(label='✕')
+        btn_clear_search.set_tooltip_text('Clear filter')
+        search_row.pack_start(btn_clear_search, False, False, 0)
+
+        # Commit list (checkbox | hash | author | subject | date)
+        # Store:  0=selected(bool)  1=hash(str)  2=author(str)  3=subject(str)  4=date(str)
+        revert_store = Gtk.ListStore(bool, str, str, str, str)
+
+        revert_tree = Gtk.TreeView(model=revert_store)
+        revert_tree.set_headers_visible(True)
+        revert_tree.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+
+        # Column 0: checkbox
+        toggle_render = Gtk.CellRendererToggle()
+        toggle_render.set_activatable(True)
+        def _on_toggle(_, path):
+            revert_store[path][0] = not revert_store[path][0]
+            _update_revert_status()
+        toggle_render.connect('toggled', _on_toggle)
+        col_chk = Gtk.TreeViewColumn('✓', toggle_render, active=0)
+        col_chk.set_fixed_width(40)
+        revert_tree.append_column(col_chk)
+
+        # Column 1: hash
+        col_hash = Gtk.TreeViewColumn('Hash', Gtk.CellRendererText(), text=1)
+        col_hash.set_fixed_width(90)
+        col_hash.set_resizable(True)
+        revert_tree.append_column(col_hash)
+
+        # Column 2: author
+        col_author = Gtk.TreeViewColumn('Author', Gtk.CellRendererText(), text=2)
+        col_author.set_fixed_width(120)
+        col_author.set_resizable(True)
+        revert_tree.append_column(col_author)
+
+        # Column 3: subject
+        col_subj = Gtk.TreeViewColumn('Subject', Gtk.CellRendererText(), text=3)
+        col_subj.set_expand(True)
+        col_subj.set_resizable(True)
+        revert_tree.append_column(col_subj)
+
+        # Column 4: date
+        col_date = Gtk.TreeViewColumn('Date', Gtk.CellRendererText(), text=4)
+        col_date.set_fixed_width(120)
+        col_date.set_resizable(True)
+        revert_tree.append_column(col_date)
+
+        revert_scroll_w = Gtk.ScrolledWindow()
+        revert_scroll_w.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        revert_scroll_w.set_min_content_height(300)
+        revert_scroll_w.add(revert_tree)
+        body.pack_start(revert_scroll_w, True, True, 0)
+
+        # Action row
+        revert_action_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        body.pack_start(revert_action_row, False, False, 0)
+
+        btn_select_all = Gtk.Button(label='Select All')
+        btn_deselect_all = Gtk.Button(label='Deselect All')
+        btn_revert_sel = Gtk.Button(label='⚠ Revert Selected')
+        btn_revert_sel.get_style_context().add_class('destructive-action')
+        for b in (btn_select_all, btn_deselect_all, btn_revert_sel):
+            revert_action_row.pack_start(b, False, False, 0)
+
+        revert_status_lbl = Gtk.Label(label='No commits loaded')
+        revert_status_lbl.set_xalign(0.0)
+        revert_status_lbl.get_style_context().add_class('dim-label')
+        revert_action_row.pack_end(revert_status_lbl, False, False, 0)
+
+        def _update_revert_status():
+            total = len(revert_store)
+            selected = sum(1 for row in revert_store if row[0])
+            if total == 0:
+                revert_status_lbl.set_text('No commits loaded')
+            else:
+                revert_status_lbl.set_text(f'{selected} of {total} selected')
+
+        # All loaded commits (full dataset before filtering)
+        _all_commits: List[tuple] = []
+
+        def _apply_filter(*_):
+            """Filter _all_commits locally and repopulate the store."""
+            query = search_entry.get_text().strip().lower()
+            mode_idx = search_mode.get_active()
+
+            if not query:
+                filtered = _all_commits
+            else:
+                filtered = []
+                for entry in _all_commits:
+                    h, author, subj, date = entry
+                    if mode_idx == 0:   # All Fields
+                        if query in h.lower() or query in author.lower() or query in subj.lower():
+                            filtered.append(entry)
+                    elif mode_idx == 1: # Author
+                        if query in author.lower():
+                            filtered.append(entry)
+                    elif mode_idx == 2: # Message
+                        if query in subj.lower():
+                            filtered.append(entry)
+                    elif mode_idx == 3: # Hash
+                        if h.lower().startswith(query):
+                            filtered.append(entry)
+                    elif mode_idx == 4: # PR #
+                        pr_q = query.lstrip('#')
+                        if f'#{pr_q}' in subj.lower() or f'!{pr_q}' in subj.lower():
+                            filtered.append(entry)
+
+            CHUNK_SIZE = 500
+            total = len(filtered)
+            revert_tree.set_model(None)
+            revert_store.clear()
+
+            def _load_chunk(start):
+                end = min(start + CHUNK_SIZE, total)
+                for i in range(start, end):
+                    h, author, subj, date = filtered[i]
+                    revert_store.append([False, h, author, subj, date])
+                if end < total:
+                    revert_status_lbl.set_text(f'Rendering… {end}/{total}')
+                    GLib.idle_add(_load_chunk, end)
+                else:
+                    revert_tree.set_model(revert_store)
+                    _update_revert_status()
+                return False
+
+            GLib.idle_add(_load_chunk, 0)
+
+        def _clear_search(*_):
+            search_entry.set_text('')
+            # 'changed' signal on search_entry will call _apply_filter automatically
+
+        btn_clear_search.connect('clicked', _clear_search)
+        search_entry.connect('changed', lambda *_: _apply_filter())
+        search_mode.connect('changed', lambda *_: _apply_filter())
+
+        def _load_revert_commits(*_):
+            rd = self._require_repo()
+            if not rd: return
+            branch = revert_combo.get_active_text()
+            if not branch:
+                self.log('Select a branch / ref first', 'warn')
+                return
+
+            load_all = load_all_chk.get_active()
+            count = int(revert_count_spin.get_value())
+
+            # Disable UI while loading
+            btn_load_commits.set_sensitive(False)
+            revert_combo.set_sensitive(False)
+            load_all_chk.set_sensitive(False)
+            search_entry.set_sensitive(False)
+            revert_status_lbl.set_text('Fetching commits…')
+
+            def _do():
+                fmt = '%h%x00%an%x00%s%x00%ar'
+                cmd = ['log', f'--format={fmt}']
+                if not load_all:
+                    cmd.append(f'--max-count={count}')
+                cmd.append(branch)
+
+                self.log(f'git {" ".join(cmd)}', 'info')
+                r = _git(rd, *cmd)
+
+                if r['returncode'] != 0:
+                    self.log(r['stderr'].strip() or 'Failed to load commits', 'err')
+                    def _fail_ui():
+                        btn_load_commits.set_sensitive(True)
+                        revert_combo.set_sensitive(True)
+                        load_all_chk.set_sensitive(True)
+                        search_entry.set_sensitive(True)
+                        revert_status_lbl.set_text('Failed to load commits')
+                    GLib.idle_add(_fail_ui)
+                    return
+
+                raw: List[tuple] = []
+                for line in r['stdout'].splitlines():
+                    parts = line.split('\x00')
+                    if len(parts) >= 4:
+                        raw.append((parts[0], parts[1], parts[2], parts[3]))
+
+                total = len(raw)
+                if not load_all and total == count:
+                    self.log(f'Note: Results capped at {count}. Check "All" or increase the limit.', 'warn')
+
+                def _done():
+                    nonlocal _all_commits
+                    _all_commits[:] = raw
+                    self.log(f'Loaded {total} commit(s) from {branch}', 'info')
+                    self.set_status(f'{total} commits loaded', C_BLUE)
+                    btn_load_commits.set_sensitive(True)
+                    revert_combo.set_sensitive(True)
+                    load_all_chk.set_sensitive(True)
+                    search_entry.set_sensitive(True)
+                    _apply_filter()
+
+                GLib.idle_add(_done)
+
+            threading.Thread(target=_do, daemon=True).start()
+
+        def _select_all(*_):
+            for row in revert_store:
+                row[0] = True
+            _update_revert_status()
+
+        def _deselect_all(*_):
+            for row in revert_store:
+                row[0] = False
+            _update_revert_status()
+
+        def _revert_selected(*_):
+            rd = self._require_repo()
+            if not rd: return
+            selected = [(row[1], row[3]) for row in revert_store if row[0]]
+            if not selected:
+                self.log('No commits selected — check the boxes first', 'warn')
+                return
+            summary_lines = '\n'.join(f'  • {h}  {s[:50]}' for h, s in selected)
+            msg = (f'Revert {len(selected)} commit(s)?\n\n{summary_lines}\n\n'
+                   f'Each commit is reverted individually (newest first).\n'
+                   f'If a conflict occurs, the process will stop.')
+            if not _ask_yes_no(self._win, 'Confirm Selective Revert', msg):
+                return
+            def _do():
+                ok_count = 0
+                fail_hash = None
+                for h, subj in selected:
+                    self.log(f'Reverting {h} — {subj[:60]}…', 'info')
+                    GLib.idle_add(self.set_status, f'Reverting {h}…', C_ORANGE)
+                    r = _git(rd, 'revert', '--no-edit', h)
+                    if r['returncode'] != 0:
+                        err_msg = r['stderr'].strip() or r['stdout'].strip()
+                        self.log(f'✖ Revert of {h} failed: {err_msg}', 'err')
+                        self.log('Fix the conflict, then run: git revert --continue\n'
+                                 'Or abort with: git revert --abort', 'warn')
+                        fail_hash = h
+                        break
+                    else:
+                        ok_count += 1
+                        self.log(f'✔ Reverted {h}', 'ok')
+                if fail_hash:
+                    GLib.idle_add(self.set_status,
+                                  f'Revert stopped at {fail_hash} (conflict)', C_RED)
+                    self.log(f'Reverted {ok_count}/{len(selected)} commits '
+                             f'— stopped at {fail_hash}', 'err')
+                else:
+                    GLib.idle_add(self.set_status,
+                                  f'✔ Reverted {ok_count} commit(s)', C_GREEN)
+                    self.log(f'✔ All {ok_count} commit(s) reverted successfully', 'ok')
+            threading.Thread(target=_do, daemon=True).start()
+
+        btn_load_commits.connect('clicked', _load_revert_commits)
+        btn_select_all.connect('clicked', _select_all)
+        btn_deselect_all.connect('clicked', _deselect_all)
+        btn_revert_sel.connect('clicked', _revert_selected)
+
+        def _populate_commits_branches():
+            rd = self._repo_path
+            if not rd: return
+
+            def _do():
+                r = _git(rd, 'branch', '-a', '--format=%(refname:short)')
+                branches = []
+                for b in r['stdout'].splitlines():
+                    b = b.strip().removeprefix('remotes/')
+                    if b and not b.startswith('HEAD'):
+                        branches.append(b)
+
+                def _apply():
+                    revert_combo.remove_all()
+                    for b in branches:
+                        revert_combo.append_text(b)
+                    revert_combo.set_active(0)
+
+                GLib.idle_add(_apply)
+
+            threading.Thread(target=_do, daemon=True).start()
+
+        self._page_reload_callbacks['commits'] = _populate_commits_branches
+        return scroll
+
     # ═══════════════════════════════════════════════════════════════════════════
     # Page: Remotes
     # ═══════════════════════════════════════════════════════════════════════════
@@ -1979,19 +2395,30 @@ class _GTKApp:
         def _refresh():
             rd = self._repo_path
             if not rd: return
-            store.clear()
-            seen = set()
-            r = _git(rd, 'remote', '-v')
-            for line in r['stdout'].splitlines():
-                parts = line.split()
-                if len(parts) < 3: continue
-                name, url, kind = parts[0], parts[1], parts[2].strip('()')
-                if (name, url, kind) in seen: continue
-                seen.add((name, url, kind))
-                color = C_GREEN if (url.startswith('git@') or url.startswith('ssh://')) \
-                        else (C_ORANGE if url.startswith('https://') else C_GRAY)
-                store.append([name, url, kind, color])
-            self.set_status(f'{len(seen)} remote entries', C_BLUE)
+
+            def _do():
+                r = _git(rd, 'remote', '-v')
+                rows = []
+                seen: set = set()
+                for line in r['stdout'].splitlines():
+                    parts = line.split()
+                    if len(parts) < 3: continue
+                    name, url, kind = parts[0], parts[1], parts[2].strip('()')
+                    if (name, url, kind) in seen: continue
+                    seen.add((name, url, kind))
+                    color = C_GREEN if (url.startswith('git@') or url.startswith('ssh://')) \
+                            else (C_ORANGE if url.startswith('https://') else C_GRAY)
+                    rows.append([name, url, kind, color])
+
+                def _populate():
+                    store.clear()
+                    for row in rows:
+                        store.append(row)
+                    self.set_status(f'{len(seen)} remote entries', C_BLUE)
+
+                GLib.idle_add(_populate)
+
+            threading.Thread(target=_do, daemon=True).start()
 
         def _sel() -> tuple:
             model, it = tree.get_selection().get_selected()
