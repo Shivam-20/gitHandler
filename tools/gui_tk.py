@@ -36,64 +36,133 @@ try:
 except Exception:
     pass
 
-# ── Colours ───────────────────────────────────────────────────────────────────
-C_GREEN  = '#2aa32a'
-C_RED    = '#cc0000'
-C_ORANGE = '#e68a00'
+# ── Colours (PyGitDesk palette) ────────────────────────────────────────────────
+C_GREEN  = '#4CAF50'
+C_RED    = '#E64A19'
+C_ORANGE = '#FF5722'
 C_BLUE   = '#1a73e8'
-C_GRAY   = '#888888'
-C_DIM    = '#aaaaaa'
+C_GRAY   = '#757575'
+C_DIM    = '#9E9E9E'
+C_ACCENT = '#E64A19'
 
 _GtkBoxBase = Gtk.Box if _GTK_OK else object  # type: ignore[name-defined]
 
-# ── Sidebar / repo-strip CSS ──────────────────────────────────────────────────
+# ── PyGitDesk-style CSS ───────────────────────────────────────────────────────
 _APP_CSS = """
+/* ── Sidebar ────────────────────────────────────────────── */
+.sidebar {
+    background-color: #555555;
+}
+.sidebar-brand {
+    color: #FFFFFF;
+    font-size: 1.15em;
+    font-weight: bold;
+    padding: 16px 14px 8px 14px;
+}
+.sidebar-section {
+    color: rgba(255,255,255,0.55);
+    font-size: 0.72em;
+    font-weight: bold;
+    letter-spacing: 0.5px;
+    padding-left: 14px;
+    padding-top: 14px;
+    padding-bottom: 2px;
+}
 .nav-button {
-    padding: 7px 10px;
-    border-radius: 5px;
+    padding: 6px 10px;
+    border-radius: 8px;
     border: none;
     background: transparent;
     box-shadow: none;
+    color: #FFFFFF;
 }
 .nav-button:hover {
-    background-color: alpha(@theme_fg_color, 0.10);
+    background-color: rgba(255,255,255,0.12);
 }
 .nav-button.nav-active {
-    background-color: @theme_selected_bg_color;
-    color: @theme_selected_fg_color;
+    background-color: rgba(255,255,255,0.22);
+    color: #FFFFFF;
     font-weight: bold;
 }
-.sidebar-section {
-    color: alpha(@theme_fg_color, 0.45);
-    font-size: 0.74em;
-    font-weight: bold;
-    padding-left: 14px;
-    padding-top: 12px;
-    padding-bottom: 1px;
+.nav-button image {
+    color: #FFFFFF;
+    -gtk-icon-style: symbolic;
 }
+
+/* ── Repo strip ─────────────────────────────────────────── */
 .repo-strip {
     padding: 5px 14px 5px 14px;
-    border-bottom: 1px solid alpha(@theme_fg_color, 0.12);
+    border-bottom: 1px solid alpha(@theme_fg_color, 0.10);
 }
+
+/* ── Branch badge ───────────────────────────────────────── */
 .branch-badge {
-    background-color: alpha(#2aa32a, 0.18);
-    color: #2aa32a;
-    border-radius: 4px;
-    padding: 1px 7px;
+    background-color: alpha(#4CAF50, 0.18);
+    color: #4CAF50;
+    border-radius: 12px;
+    padding: 2px 10px;
     font-size: 0.85em;
     font-weight: bold;
 }
+
+/* ── Content area — inherit theme bg so dark/light both work ── */
+.content-bg {
+    background-color: alpha(@theme_bg_color, 0.95);
+}
+
+/* ── Buttons (PyGitDesk pill style) ─────────────────────── */
+button.suggested-action {
+    background-image: none;
+    background-color: #E64A19;
+    color: #FFFFFF;
+    border-radius: 20px;
+    border: none;
+    padding: 6px 18px;
+    font-weight: bold;
+    box-shadow: none;
+}
+button.suggested-action:hover {
+    background-color: #D84315;
+}
+button.destructive-action {
+    background-image: none;
+    background-color: #C62828;
+    color: #FFFFFF;
+    border-radius: 20px;
+    border: none;
+    padding: 6px 18px;
+    font-weight: bold;
+    box-shadow: none;
+}
+button.destructive-action:hover {
+    background-color: #B71C1C;
+}
+
+/* ── Misc. ──────────────────────────────────────────────── */
 .diff-view {
     font-family: monospace;
 }
 .dim-label {
-    color: alpha(@theme_fg_color, 0.45);
+    color: alpha(@theme_fg_color, 0.50);
     font-size: 0.88em;
 }
 entry.commit-error {
-    border-color: #cc0000;
-    box-shadow: inset 0 0 0 1px #cc0000;
-    background-color: alpha(#cc0000, 0.05);
+    border-color: #E64A19;
+    box-shadow: inset 0 0 0 1px #E64A19;
+    background-color: alpha(#E64A19, 0.06);
+}
+
+/* ── Status bar ─────────────────────────────────────────── */
+.status-bar {
+    background-color: alpha(@theme_bg_color, 0.85);
+    padding: 4px 12px;
+}
+
+/* ── Section headings (theme-aware) ─────────────────────── */
+.section-heading {
+    font-weight: bold;
+    font-size: 1.05em;
+    color: @theme_fg_color;
 }
 """
 
@@ -393,7 +462,7 @@ class _GTKApp:
         header = Gtk.HeaderBar()
         header.set_show_close_button(True)
         header.props.title = 'SSH Git Manager'
-        header.props.subtitle = 'Keys · Remotes · Branches · Commits'
+        header.props.subtitle = 'PyGitDesk · Keys · Remotes · Branches · Commits'
         self._win.set_titlebar(header)
 
         try:
@@ -416,14 +485,18 @@ class _GTKApp:
         root.pack_start(body, True, True, 0)
 
         sidebar = self._build_sidebar()
-        sidebar.set_size_request(170, -1)
+        sidebar.set_size_request(180, -1)
+        sidebar.get_style_context().add_class('sidebar')
         body.pack_start(sidebar, False, False, 0)
         body.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 0)
 
+        stack_wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        stack_wrap.get_style_context().add_class('content-bg')
         self.stack = Gtk.Stack()
         self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
         self.stack.set_transition_duration(100)
-        body.pack_start(self.stack, True, True, 0)
+        stack_wrap.pack_start(self.stack, True, True, 0)
+        body.pack_start(stack_wrap, True, True, 0)
 
         root.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 0)
 
@@ -433,6 +506,7 @@ class _GTKApp:
 
         # Status bar
         status_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        status_bar.get_style_context().add_class('status-bar')
         status_bar.set_margin_start(12)
         status_bar.set_margin_top(4)
         status_bar.set_margin_bottom(4)
@@ -470,6 +544,27 @@ class _GTKApp:
     def _build_sidebar(self) -> 'Gtk.Box':
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
 
+        # Brand header
+        brand = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        brand.set_margin_start(14); brand.set_margin_end(14)
+        brand.set_margin_top(14);   brand.set_margin_bottom(6)
+        try:
+            brand_icon = Gtk.Image.new_from_icon_name(
+                'applications-development-symbolic', Gtk.IconSize.DND)
+            brand.pack_start(brand_icon, False, False, 0)
+        except Exception:
+            pass
+        brand_label = Gtk.Label(label='SSH Git Manager')
+        brand_label.get_style_context().add_class('sidebar-brand')
+        brand_label.set_xalign(0.0)
+        brand.pack_start(brand_label, True, True, 0)
+        box.pack_start(brand, False, False, 0)
+
+        brand_sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        brand_sep.set_margin_start(10); brand_sep.set_margin_end(10)
+        brand_sep.set_margin_top(4);    brand_sep.set_margin_bottom(4)
+        box.pack_start(brand_sep, False, False, 0)
+
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scroll.set_hexpand(False)
@@ -482,7 +577,6 @@ class _GTKApp:
                 lbl = Gtk.Label(label=section)
                 lbl.set_xalign(0.0)
                 lbl.get_style_context().add_class('sidebar-section')
-                lbl.set_sensitive(False)
                 inner.pack_start(lbl, False, False, 0)
             else:
                 btn = Gtk.Button()
@@ -750,9 +844,10 @@ class _GTKApp:
 
         for label, cb in [
             ('List Branches',
-             lambda *_: [self.log(b, 'dim') for b in clone_actions.list_branches(_repo_ref['path'] or '')]),
+             lambda *_: [self.log(b, 'dim') for b in clone_actions.list_branches(_repo_ref['path'])]
+                         if _repo_ref.get('path') else self.log('Clone a repo first', 'warn')),
             ('Checkout Branch',
-             lambda *_: _checkout_post()),
+             lambda *_: _checkout_post() if _repo_ref.get('path') else self.log('Clone a repo first', 'warn')),
             ('Open Folder',
              lambda *_: os.system(f'xdg-open {shlex.quote(_repo_ref["path"] or ".")} &')),
             ('→ Status Page', _go_status),
@@ -800,6 +895,7 @@ class _GTKApp:
                     _repo_ref['path'] = rd
                     _add_recent(rd)
                     self.log(f'✔ Cloned → {rd}', 'ok')
+                    GLib.idle_add(self._repo_bar._rebuild_recent_menu)
                     self.set_status('Clone succeeded', C_GREEN)
                     GLib.idle_add(clone_status.set_markup,
                                   _markup(f'● Cloned → {rd}', C_GREEN, bold=True))
@@ -1020,6 +1116,7 @@ class _GTKApp:
         commit_entry.set_hexpand(True)
         commit_entry.connect('changed', lambda e: char_counter.set_label(
             f'{len(e.get_text())} chars'))
+        commit_entry.connect('changed', lambda e: e.get_style_context().remove_class('commit-error'))
         commit_box.pack_start(commit_entry, False, False, 0)
 
         # File-ops row
@@ -2229,22 +2326,26 @@ class _GTKApp:
         inner_box.pack_start(agent_lbl, False, False, 0)
 
         def _refresh():
-            store.clear()
-            keys = ssh_keys.discover_keys()
-            for k in keys:
-                perms = '✔' if k.get('permissions_ok') else '✖'
-                dup   = '●' if k.get('duplicate') else ''
-                fp    = k.get('fingerprint') or '—'
-                color = C_ORANGE if k.get('duplicate') else \
-                        (C_RED if not k.get('permissions_ok') else C_GREEN)
-                store.append([k.get('path', ''), k.get('type', '—'), perms, dup, fp, color])
-            import subprocess
-            ar = subprocess.run(['ssh-add', '-l'], capture_output=True, text=True)
-            lines = ar.stdout.strip() or ar.stderr.strip() or '(no keys loaded)'
-            GLib.idle_add(agent_lbl.set_markup,
-                          _markup(lines, C_GREEN if ar.returncode == 0 else C_GRAY))
-            self.log(f'Found {len(keys)} key(s)', 'info')
-            self.set_status(f'{len(keys)} key(s) found', C_BLUE)
+            def _do():
+                import subprocess
+                keys = ssh_keys.discover_keys()
+                ar = subprocess.run(['ssh-add', '-l'], capture_output=True, text=True)
+                lines = ar.stdout.strip() or ar.stderr.strip() or '(no keys loaded)'
+                def _populate():
+                    store.clear()
+                    for k in keys:
+                        perms = '✔' if k.get('permissions_ok') else '✖'
+                        dup   = '●' if k.get('duplicate') else ''
+                        fp    = k.get('fingerprint') or '—'
+                        color = C_ORANGE if k.get('duplicate') else \
+                                (C_RED if not k.get('permissions_ok') else C_GREEN)
+                        store.append([k.get('path', ''), k.get('type', '—'), perms, dup, fp, color])
+                    agent_lbl.set_markup(
+                        _markup(lines, C_GREEN if ar.returncode == 0 else C_GRAY))
+                    self.log(f'Found {len(keys)} key(s)', 'info')
+                    self.set_status(f'{len(keys)} key(s) found', C_BLUE)
+                GLib.idle_add(_populate)
+            threading.Thread(target=_do, daemon=True).start()
 
         def _sel_path() -> Optional[str]:
             return self._get_selected_value(tree, 0)
@@ -2291,11 +2392,13 @@ class _GTKApp:
         def _remove_agent():
             path = _sel_path()
             if not path: return
-            import subprocess
-            r = subprocess.run(['ssh-add', '-d', path], capture_output=True, text=True)
-            self.log('✔ Removed from agent' if r.returncode == 0
-                     else r.stderr.strip(), 'ok' if r.returncode == 0 else 'err')
-            _refresh()
+            def _do():
+                import subprocess
+                r = subprocess.run(['ssh-add', '-d', path], capture_output=True, text=True)
+                self.log('✔ Removed from agent' if r.returncode == 0
+                         else r.stderr.strip(), 'ok' if r.returncode == 0 else 'err')
+                GLib.idle_add(_refresh)
+            threading.Thread(target=_do, daemon=True).start()
 
         outer.pack_start(self._sep(), False, False, 0)
         outer.pack_start(self._action_bar(
