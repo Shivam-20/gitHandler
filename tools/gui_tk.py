@@ -1296,31 +1296,39 @@ class _GTKApp:
         diff_scroll, _diff_tv, diff_buf = _make_diff_view()
         paned.pack2(diff_scroll, resize=True, shrink=True)
 
+        LOG_DISPLAY_CAP = 500
+        _log_filter_timer = [0]
+
         def _log_apply_filter(*_):
             q = log_search_entry.get_text().strip().lower()
             rows = _log_all_rows if not q else [
                 row for row in _log_all_rows
                 if q in row[1].lower() or q in row[2].lower() or q in row[4].lower()
             ]
-            CHUNK = 500
             total = len(rows)
+            display = rows[:LOG_DISPLAY_CAP]
             tree.set_model(None)
             store.clear()
+            for row in display:
+                store.append(row)
+            tree.set_model(store)
+            if total > LOG_DISPLAY_CAP:
+                self.set_status(
+                    f'Showing {LOG_DISPLAY_CAP} of {total} matches — narrow your search', C_BLUE)
+            else:
+                self.set_status(f'{total} commits shown', C_BLUE)
 
-            def _chunk(start):
-                end = min(start + CHUNK, total)
-                for row in rows[start:end]:
-                    store.append(row)
-                if end < total:
-                    GLib.idle_add(_chunk, end)
-                else:
-                    tree.set_model(store)
-                    self.set_status(f'{total} commits shown', C_BLUE)
-                return False
+        def _log_debounced_filter(*_):
+            if _log_filter_timer[0]:
+                GLib.source_remove(_log_filter_timer[0])
+            _log_filter_timer[0] = GLib.timeout_add(300, _log_fire_filter)
 
-            GLib.idle_add(_chunk, 0)
+        def _log_fire_filter():
+            _log_filter_timer[0] = 0
+            _log_apply_filter()
+            return False
 
-        log_search_entry.connect('changed', _log_apply_filter)
+        log_search_entry.connect('changed', _log_debounced_filter)
 
         def _refresh():
             rd = self._repo_path
@@ -1487,7 +1495,7 @@ class _GTKApp:
         lbl.set_hexpand(True); lbl.set_xalign(0.0)
         tb.pack_start(lbl, True, True, 0)
         show_remote = Gtk.CheckButton(label='Show remote')
-        show_remote.set_active(True)
+        show_remote.set_active(False)
         show_remote.connect('toggled', lambda _: _refresh())
         tb.pack_start(show_remote, False, False, 0)
         tb.pack_start(Gtk.Button(label='↺ Refresh'), False, False, 0)
@@ -1584,21 +1592,27 @@ class _GTKApp:
             if not rd: return
 
             def _do():
+                BRANCH_CAP = 500
                 cur = _git(rd, 'rev-parse', '--abbrev-ref', 'HEAD').get('stdout', '').strip()
                 _state['current'] = cur
-                r = _git(rd, 'branch', '-a', '--format=%(refname:short)')
-                rows = []
                 show_rem = show_remote.get_active()
+                cmd = ['branch', '-a', '--format=%(refname:short)'] if show_rem \
+                    else ['branch', '--format=%(refname:short)']
+                r = _git(rd, *cmd)
+                rows = []
+                capped = False
                 for raw in r['stdout'].splitlines():
                     b = raw.strip().removeprefix('remotes/')
                     if not b or b.startswith('HEAD'): continue
                     is_remote = '/' in b
-                    if is_remote and not show_rem: continue
                     loc    = 'remote' if is_remote else 'local'
                     note   = '● current' if b == cur else ''
                     color  = C_GREEN if b == cur else (C_GRAY if is_remote else '#cdd6f4')
                     weight = Pango.Weight.BOLD if b == cur else Pango.Weight.NORMAL
                     rows.append([b, loc, note, color, weight])
+                    if len(rows) >= BRANCH_CAP:
+                        capped = True
+                        break
                 sr = _git(rd, 'stash', 'list', '--format=%gd|%ci|%s')
                 stash_rows = []
                 for line in sr['stdout'].splitlines():
@@ -1614,6 +1628,8 @@ class _GTKApp:
                     stash_store.clear()
                     for row in stash_rows:
                         stash_store.append(row)
+                    if capped:
+                        self.log(f'Showing first {BRANCH_CAP} branches (too many to display all)', 'warn')
 
                 GLib.idle_add(_populate)
 
@@ -1887,11 +1903,11 @@ class _GTKApp:
             if not rd: return
 
             def _do():
-                r = _git(rd, 'branch', '-a', '--format=%(refname:short)')
+                # Local branches only (remote branches can be thousands — kills ComboBox)
+                r = _git(rd, 'branch', '--format=%(refname:short)')
                 branches = [
-                    b.strip().removeprefix('remotes/')
-                    for b in r['stdout'].splitlines()
-                    if b.strip() and not b.strip().removeprefix('remotes/').startswith('HEAD')
+                    b.strip() for b in r['stdout'].splitlines()
+                    if b.strip()
                 ]
 
                 def _apply():
@@ -2070,7 +2086,9 @@ class _GTKApp:
         toggle_render = Gtk.CellRendererToggle()
         toggle_render.set_activatable(True)
         def _on_toggle(_, path):
-            revert_store[path][0] = not revert_store[path][0]
+            was = revert_store[path][0]
+            revert_store[path][0] = not was
+            _selected_count[0] += (-1 if was else 1)
             _update_revert_status()
         toggle_render.connect('toggled', _on_toggle)
         col_chk = Gtk.TreeViewColumn('✓', toggle_render, active=0)
@@ -2123,19 +2141,28 @@ class _GTKApp:
         revert_status_lbl.get_style_context().add_class('dim-label')
         revert_action_row.pack_end(revert_status_lbl, False, False, 0)
 
+        # Track selected count to avoid O(n) iterations on every toggle
+        _selected_count = [0]
+        # Max rows shown in the treeview (prevents GTK from choking on huge lists)
+        DISPLAY_CAP = 500
+
         def _update_revert_status():
             total = len(revert_store)
-            selected = sum(1 for row in revert_store if row[0])
+            sel = _selected_count[0]
             if total == 0:
                 revert_status_lbl.set_text('No commits loaded')
             else:
-                revert_status_lbl.set_text(f'{selected} of {total} selected')
+                revert_status_lbl.set_text(f'{sel} of {total} selected')
 
         # All loaded commits (full dataset before filtering)
         _all_commits: List[tuple] = []
+        # Last filter result (for revert — includes non-displayed entries)
+        _filtered_commits: List[tuple] = []
+        # Debounce timer ID for search
+        _filter_timer = [0]
 
         def _apply_filter(*_):
-            """Filter _all_commits locally and repopulate the store."""
+            """Filter _all_commits locally and repopulate the store (capped)."""
             query = search_entry.get_text().strip().lower()
             mode_idx = search_mode.get_active()
 
@@ -2162,32 +2189,40 @@ class _GTKApp:
                         if f'#{pr_q}' in subj.lower() or f'!{pr_q}' in subj.lower():
                             filtered.append(entry)
 
-            CHUNK_SIZE = 500
-            total = len(filtered)
+            _filtered_commits[:] = filtered
+            total_matches = len(filtered)
+            display = filtered[:DISPLAY_CAP]
+
             revert_tree.set_model(None)
             revert_store.clear()
+            _selected_count[0] = 0
+            for h, author, subj, date in display:
+                revert_store.append([False, h, author, subj, date])
+            revert_tree.set_model(revert_store)
 
-            def _load_chunk(start):
-                end = min(start + CHUNK_SIZE, total)
-                for i in range(start, end):
-                    h, author, subj, date = filtered[i]
-                    revert_store.append([False, h, author, subj, date])
-                if end < total:
-                    revert_status_lbl.set_text(f'Rendering… {end}/{total}')
-                    GLib.idle_add(_load_chunk, end)
-                else:
-                    revert_tree.set_model(revert_store)
-                    _update_revert_status()
-                return False
+            if total_matches > DISPLAY_CAP:
+                revert_status_lbl.set_text(
+                    f'Showing {DISPLAY_CAP} of {total_matches} matches '
+                    f'(narrow your search to see more)')
+            else:
+                _update_revert_status()
 
-            GLib.idle_add(_load_chunk, 0)
+        def _debounced_filter(*_):
+            """Wait 300ms after last keystroke before filtering."""
+            if _filter_timer[0]:
+                GLib.source_remove(_filter_timer[0])
+            _filter_timer[0] = GLib.timeout_add(300, _fire_filter)
+
+        def _fire_filter():
+            _filter_timer[0] = 0
+            _apply_filter()
+            return False
 
         def _clear_search(*_):
             search_entry.set_text('')
-            # 'changed' signal on search_entry will call _apply_filter automatically
 
         btn_clear_search.connect('clicked', _clear_search)
-        search_entry.connect('changed', lambda *_: _apply_filter())
+        search_entry.connect('changed', _debounced_filter)
         search_mode.connect('changed', lambda *_: _apply_filter())
 
         def _load_revert_commits(*_):
@@ -2257,11 +2292,13 @@ class _GTKApp:
         def _select_all(*_):
             for row in revert_store:
                 row[0] = True
+            _selected_count[0] = len(revert_store)
             _update_revert_status()
 
         def _deselect_all(*_):
             for row in revert_store:
                 row[0] = False
+            _selected_count[0] = 0
             _update_revert_status()
 
         def _revert_selected(*_):
@@ -2315,11 +2352,12 @@ class _GTKApp:
             if not rd: return
 
             def _do():
-                r = _git(rd, 'branch', '-a', '--format=%(refname:short)')
+                # Local branches only (remote branches can be thousands — kills ComboBox)
+                r = _git(rd, 'branch', '--format=%(refname:short)')
                 branches = []
                 for b in r['stdout'].splitlines():
-                    b = b.strip().removeprefix('remotes/')
-                    if b and not b.startswith('HEAD'):
+                    b = b.strip()
+                    if b:
                         branches.append(b)
 
                 def _apply():
