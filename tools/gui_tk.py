@@ -19,12 +19,13 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 try:
-    from tools import ssh_keys, core, clone_actions, ssh_config
+    from tools import ssh_keys, core, clone_actions, ssh_config, settings
 except Exception:
     import tools.ssh_keys as ssh_keys          # type: ignore
     import tools.core as core                  # type: ignore
     import tools.clone_actions as clone_actions  # type: ignore
     import tools.ssh_config as ssh_config      # type: ignore
+    import tools.settings as settings          # type: ignore
 
 # ── GTK import ────────────────────────────────────────────────────────────────
 _GTK_OK = False
@@ -338,6 +339,18 @@ class _RepoBar(_GtkBoxBase):
         self._branch_lbl.set_markup(_markup('no repo', C_GRAY))
         self.pack_start(self._branch_lbl, False, False, 0)
 
+        sep2 = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        sep2.set_margin_start(4); sep2.set_margin_end(4)
+        self.pack_start(sep2, False, False, 0)
+
+        self._btn_pull = Gtk.Button(label='↓ Pull')
+        self._btn_pull.set_tooltip_text('Fetch and merge from upstream (Ctrl+Shift+P)')
+        self.pack_start(self._btn_pull, False, False, 0)
+
+        self._btn_push = Gtk.Button(label='↑ Push')
+        self._btn_push.set_tooltip_text('Push current branch to remote (Ctrl+Shift+U)')
+        self.pack_start(self._btn_push, False, False, 0)
+
         self._rebuild_recent_menu()
 
     def set_path(self, path: str) -> None:
@@ -448,23 +461,52 @@ class _GTKApp:
         self._log_buffer = None
         self._log_view   = None
         self._status_lbl = None
+        self._status_spinner = None
         self._repo_bar: Optional[_RepoBar] = None
         self._win = None
         self.stack = None
+        self._load_generation = 0
+        self._async_count = 0
+        self._sidebar_box = None
+        self._log_box = None
+        self._page_search_entries: Dict[str, 'Gtk.Entry'] = {}
         self._build_window()
 
     # ── Window skeleton ───────────────────────────────────────────────────────
     def _build_window(self):
+        cfg = settings.load_settings()
         self._win = Gtk.Window(title='SSH Git Manager')
-        self._win.set_default_size(1100, 740)
+        self._win.set_default_size(cfg.get('window_width', 1100),
+                                    cfg.get('window_height', 740))
         self._win.set_resizable(True)
-        self._win.connect('delete-event', Gtk.main_quit)
+        self._win.connect('delete-event', self._on_window_close)
+
+        # Apply theme
+        gtk_settings = Gtk.Settings.get_default()
+        theme = cfg.get('theme', 'dark')
+        if theme == 'dark':
+            gtk_settings.set_property('gtk-application-prefer-dark-theme', True)
+        elif theme == 'light':
+            gtk_settings.set_property('gtk-application-prefer-dark-theme', False)
 
         header = Gtk.HeaderBar()
         header.set_show_close_button(True)
         header.props.title = 'SSH Git Manager'
         header.props.subtitle = 'PyGitDesk · Keys · Remotes · Branches · Commits'
         self._win.set_titlebar(header)
+
+        # Hamburger menu
+        menu_btn = Gtk.MenuButton()
+        menu_btn.set_image(Gtk.Image.new_from_icon_name('open-menu-symbolic', Gtk.IconSize.BUTTON))
+        menu_btn.set_tooltip_text('Menu')
+        menu_model = self._build_app_menu()
+        menu_btn.set_popup(menu_model)
+        header.pack_end(menu_btn)
+
+        # Keyboard shortcuts
+        self._accel_group = Gtk.AccelGroup()
+        self._win.add_accel_group(self._accel_group)
+        self._setup_shortcuts()
 
         try:
             self._set_icon()
@@ -489,6 +531,7 @@ class _GTKApp:
         sidebar.set_size_request(180, -1)
         sidebar.get_style_context().add_class('sidebar')
         body.pack_start(sidebar, False, False, 0)
+        self._sidebar_box = sidebar
         body.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 0)
 
         stack_wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -502,7 +545,8 @@ class _GTKApp:
         root.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 0)
 
         # Output log
-        root.pack_start(self._build_log(), False, False, 0)
+        self._log_box = self._build_log()
+        root.pack_start(self._log_box, False, False, 0)
         root.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 0)
 
         # Status bar
@@ -512,6 +556,8 @@ class _GTKApp:
         status_bar.set_margin_top(4)
         status_bar.set_margin_bottom(4)
         root.pack_start(status_bar, False, False, 0)
+        self._status_spinner = Gtk.Spinner()
+        status_bar.pack_start(self._status_spinner, False, False, 0)
         self._status_lbl = Gtk.Label()
         self._status_lbl.set_markup(_markup('● Ready', C_GRAY))
         status_bar.pack_start(self._status_lbl, False, False, 0)
@@ -531,7 +577,22 @@ class _GTKApp:
         for key, builder in pages:
             self.stack.add_named(builder(), key)
 
+        # Wire pull/push buttons
+        self._repo_bar._btn_pull.connect('clicked', lambda _: self._do_pull())
+        self._repo_bar._btn_push.connect('clicked', lambda _: self._do_push())
+
+        # Apply saved visibility
+        if not cfg.get('sidebar_visible', True):
+            self._sidebar_box.set_visible(False)
+        if not cfg.get('log_panel_visible', True):
+            self._log_box.set_visible(False)
+
         self._win.show_all()
+        # Navigate to last page if configured
+        if cfg.get('restore_last_page', True):
+            last = cfg.get('last_page', 'status')
+            if last:
+                self._navigate(last)
         GLib.idle_add(self._load_startup_repo)
 
     # ── CSS ───────────────────────────────────────────────────────────────────
@@ -622,12 +683,17 @@ class _GTKApp:
     # ── Global repo state ─────────────────────────────────────────────────────
     def _on_global_repo_load(self, rd: str):
         self._repo_path = rd
+        self._load_generation += 1
+        gen = self._load_generation
         _add_recent(rd)
         self._repo_bar._rebuild_recent_menu()
 
         def _do():
             r = _git(rd, 'rev-parse', '--abbrev-ref', 'HEAD')
             branch = r.get('stdout', '').strip() or '?'
+            # Guard: skip if a newer load has been triggered
+            if gen != self._load_generation:
+                return
             self._current_branch = branch
             GLib.idle_add(self._repo_bar.update_branch, branch)
             name = Path(rd).name
@@ -637,7 +703,7 @@ class _GTKApp:
             if current and current in self._page_reload_callbacks:
                 GLib.idle_add(self._page_reload_callbacks[current])
 
-        threading.Thread(target=_do, daemon=True).start()
+        self._run_async(_do)
 
     def _load_startup_repo(self):
         recent = _load_recent()
@@ -707,6 +773,305 @@ class _GTKApp:
                         'Use the repo bar at the top to load a repository first.')
             return None
         return self._repo_path
+
+    def _run_async(self, fn, on_done=None, on_error=None, progress=True):
+        """Run *fn* in a daemon thread with error handling and optional spinner."""
+        if progress:
+            self._async_count += 1
+            if self._status_spinner:
+                GLib.idle_add(self._status_spinner.start)
+
+        def _safe():
+            try:
+                fn()
+            except Exception as exc:
+                self.log(f'Error: {exc}', 'err')
+                if on_error:
+                    GLib.idle_add(on_error, str(exc))
+            finally:
+                if on_done:
+                    GLib.idle_add(on_done)
+                if progress:
+                    self._async_count -= 1
+                    if self._async_count <= 0:
+                        self._async_count = 0
+                        if self._status_spinner:
+                            GLib.idle_add(self._status_spinner.stop)
+
+        threading.Thread(target=_safe, daemon=True).start()
+
+    # ── Window close handler ────────────────────────────────────────────────
+    def _on_window_close(self, *_):
+        w, h = self._win.get_size()
+        settings.put('window_width', w)
+        settings.put('window_height', h)
+        current_page = self.stack.get_visible_child_name()
+        if current_page:
+            settings.put('last_page', current_page)
+        settings.put('sidebar_visible', self._sidebar_box.get_visible()
+                      if self._sidebar_box else True)
+        settings.put('log_panel_visible', self._log_box.get_visible()
+                      if self._log_box else True)
+        settings.save_settings()
+        Gtk.main_quit()
+
+    # ── Hamburger menu ────────────────────────────────────────────────────
+    def _build_app_menu(self) -> 'Gtk.Menu':
+        menu = Gtk.Menu()
+
+        def _mi(label, cb=None, accel_label=None):
+            item = Gtk.MenuItem(label=label)
+            if cb:
+                item.connect('activate', lambda _: cb())
+            menu.append(item)
+            return item
+
+        _mi('Toggle Sidebar          Ctrl+B', lambda: self._toggle_sidebar())
+        _mi('Toggle Log Panel        Ctrl+L', lambda: self._toggle_log())
+        _mi('Fullscreen              F11', lambda: self._toggle_fullscreen())
+        menu.append(Gtk.SeparatorMenuItem())
+        _mi('Refresh                 F5', lambda: self._do_refresh())
+        _mi('Find / Search           Ctrl+F', lambda: self._focus_search())
+        menu.append(Gtk.SeparatorMenuItem())
+        _mi('Preferences…            Ctrl+,', lambda: self._show_preferences())
+        _mi('Keyboard Shortcuts      Ctrl+?', lambda: self._show_shortcuts_dialog())
+        _mi('About', lambda: self._show_about())
+        menu.show_all()
+        return menu
+
+    # ── Keyboard shortcuts ────────────────────────────────────────────────
+    def _setup_shortcuts(self):
+        ag = self._accel_group
+        km = Gdk.ModifierType
+
+        def _add(key, mod, cb):
+            ag.connect(Gdk.keyval_from_name(key), mod, Gtk.AccelFlags.VISIBLE,
+                       lambda *_: cb() or True)
+
+        _add('b', km.CONTROL_MASK, self._toggle_sidebar)
+        _add('l', km.CONTROL_MASK, self._toggle_log)
+        _add('F11', 0, self._toggle_fullscreen)
+        _add('F5', 0, self._do_refresh)
+        _add('r', km.CONTROL_MASK, self._do_refresh)
+        _add('f', km.CONTROL_MASK, self._focus_search)
+        _add('comma', km.CONTROL_MASK, self._show_preferences)
+        _add('question', km.CONTROL_MASK | km.SHIFT_MASK, self._show_shortcuts_dialog)
+        # Pull / Push
+        _add('p', km.CONTROL_MASK | km.SHIFT_MASK, self._do_pull)
+        _add('u', km.CONTROL_MASK | km.SHIFT_MASK, self._do_push)
+        # Navigate pages: Ctrl+1..9
+        page_keys = ['clone', 'status', 'log', 'commits', 'branches',
+                      'merge', 'remotes', 'worktrees', 'keys']
+        for idx, pk in enumerate(page_keys):
+            num = str(idx + 1)
+            _add(num, km.CONTROL_MASK, lambda k=pk: self._navigate(k))
+
+    def _toggle_sidebar(self):
+        if self._sidebar_box:
+            vis = not self._sidebar_box.get_visible()
+            self._sidebar_box.set_visible(vis)
+            settings.put('sidebar_visible', vis)
+
+    def _toggle_log(self):
+        if self._log_box:
+            vis = not self._log_box.get_visible()
+            self._log_box.set_visible(vis)
+            settings.put('log_panel_visible', vis)
+
+    def _toggle_fullscreen(self):
+        if hasattr(self, '_is_fullscreen') and self._is_fullscreen:
+            self._win.unfullscreen()
+            self._is_fullscreen = False
+        else:
+            self._win.fullscreen()
+            self._is_fullscreen = True
+
+    def _do_refresh(self):
+        current = self.stack.get_visible_child_name()
+        if current and current in self._page_reload_callbacks:
+            self._page_reload_callbacks[current]()
+
+    def _focus_search(self):
+        current = self.stack.get_visible_child_name()
+        entry = self._page_search_entries.get(current)
+        if entry:
+            entry.grab_focus()
+
+    def _do_pull(self):
+        rd = self._require_repo()
+        if not rd:
+            return
+        def _do():
+            self.log('git pull…', 'info')
+            self.set_status('Pulling…', C_ORANGE)
+            r = _git(rd, 'pull')
+            self.log(r['stdout'].strip() or '✔ Up to date',
+                     'ok' if r['returncode'] == 0 else 'err')
+            if r['returncode'] != 0:
+                self.log(r['stderr'], 'err')
+            self.set_status('Pull done' if r['returncode'] == 0 else 'Pull failed',
+                            C_GREEN if r['returncode'] == 0 else C_RED)
+        self._run_async(_do)
+
+    def _do_push(self):
+        rd = self._require_repo()
+        if not rd:
+            return
+        def _do():
+            self.log('git push…', 'info')
+            self.set_status('Pushing…', C_ORANGE)
+            r = _git(rd, 'push')
+            self.log(r['stdout'].strip() or r['stderr'].strip() or '✔ Pushed',
+                     'ok' if r['returncode'] == 0 else 'err')
+            self.set_status('Push done' if r['returncode'] == 0 else 'Push failed',
+                            C_GREEN if r['returncode'] == 0 else C_RED)
+        self._run_async(_do)
+
+    # ── Context menu helper ───────────────────────────────────────────────
+    @staticmethod
+    def _add_context_menu(tree_view, items_fn):
+        """Add right-click context menu to a TreeView.
+        items_fn(model, iter) -> [(label, callback), ...]
+        """
+        def _on_button_press(widget, event):
+            if event.button != 3:
+                return False
+            path_info = widget.get_path_at_pos(int(event.x), int(event.y))
+            if not path_info:
+                return False
+            path = path_info[0]
+            widget.get_selection().select_path(path)
+            model = widget.get_model()
+            it = model.get_iter(path)
+            items = items_fn(model, it)
+            if not items:
+                return False
+            menu = Gtk.Menu()
+            for label, cb in items:
+                mi = Gtk.MenuItem(label=label)
+                mi.connect('activate', lambda _, f=cb: f())
+                menu.append(mi)
+            menu.show_all()
+            menu.popup_at_pointer(event)
+            return True
+        tree_view.connect('button-press-event', _on_button_press)
+
+    # ── Preferences dialog ────────────────────────────────────────────────
+    def _show_preferences(self):
+        dlg = Gtk.Dialog(title='Preferences', transient_for=self._win,
+                         flags=Gtk.DialogFlags.MODAL | Gtk.DialogFlags.DESTROY_WITH_PARENT)
+        dlg.set_default_size(450, -1)
+        dlg.add_button('Close', Gtk.ResponseType.CLOSE)
+        box = dlg.get_content_area()
+        box.set_margin_top(16); box.set_margin_bottom(16)
+        box.set_margin_start(16); box.set_margin_end(16)
+        box.set_spacing(12)
+
+        # Theme
+        theme_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        theme_box.pack_start(Gtk.Label(label='Theme:'), False, False, 0)
+        theme_combo = Gtk.ComboBoxText()
+        for t in ('dark', 'light', 'system'):
+            theme_combo.append_text(t)
+        current_theme = settings.get('theme', 'dark')
+        theme_combo.set_active({'dark': 0, 'light': 1, 'system': 2}.get(current_theme, 0))
+        theme_box.pack_start(theme_combo, True, True, 0)
+        box.pack_start(theme_box, False, False, 0)
+
+        # Font scale
+        font_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        font_box.pack_start(Gtk.Label(label='Font Scale:'), False, False, 0)
+        font_adj = Gtk.Adjustment(value=settings.get('font_scale', 1.0),
+                                   lower=0.8, upper=1.5, step_increment=0.1)
+        font_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=font_adj)
+        font_scale.set_digits(1)
+        font_scale.set_hexpand(True)
+        font_box.pack_start(font_scale, True, True, 0)
+        box.pack_start(font_box, False, False, 0)
+
+        # Toggles
+        sidebar_chk = Gtk.CheckButton(label='Show sidebar on startup')
+        sidebar_chk.set_active(settings.get('sidebar_visible', True))
+        box.pack_start(sidebar_chk, False, False, 0)
+
+        log_chk = Gtk.CheckButton(label='Show log panel on startup')
+        log_chk.set_active(settings.get('log_panel_visible', True))
+        box.pack_start(log_chk, False, False, 0)
+
+        restore_chk = Gtk.CheckButton(label='Restore last active page on startup')
+        restore_chk.set_active(settings.get('restore_last_page', True))
+        box.pack_start(restore_chk, False, False, 0)
+
+        # Limits
+        limits_grid = Gtk.Grid(row_spacing=8, column_spacing=12)
+        box.pack_start(limits_grid, False, False, 0)
+        limits_grid.attach(Gtk.Label(label='Default commit limit:'), 0, 0, 1, 1)
+        commit_spin = Gtk.SpinButton.new_with_range(50, 10000, 50)
+        commit_spin.set_value(settings.get('commit_limit', 500))
+        limits_grid.attach(commit_spin, 1, 0, 1, 1)
+        limits_grid.attach(Gtk.Label(label='Default revert limit:'), 0, 1, 1, 1)
+        revert_spin = Gtk.SpinButton.new_with_range(10, 10000, 10)
+        revert_spin.set_value(settings.get('revert_limit', 100))
+        limits_grid.attach(revert_spin, 1, 1, 1, 1)
+
+        dlg.show_all()
+        dlg.run()
+
+        # Save
+        theme_val = theme_combo.get_active_text() or 'dark'
+        settings.put('theme', theme_val)
+        settings.put('font_scale', font_adj.get_value())
+        settings.put('sidebar_visible', sidebar_chk.get_active())
+        settings.put('log_panel_visible', log_chk.get_active())
+        settings.put('restore_last_page', restore_chk.get_active())
+        settings.put('commit_limit', int(commit_spin.get_value()))
+        settings.put('revert_limit', int(revert_spin.get_value()))
+
+        # Apply theme immediately
+        gtk_s = Gtk.Settings.get_default()
+        if theme_val == 'dark':
+            gtk_s.set_property('gtk-application-prefer-dark-theme', True)
+        elif theme_val == 'light':
+            gtk_s.set_property('gtk-application-prefer-dark-theme', False)
+
+        # Apply font scale
+        scale = font_adj.get_value()
+        if scale != 1.0:
+            css = Gtk.CssProvider()
+            css.load_from_data(f'* {{ font-size: {scale}em; }}'.encode())
+            Gtk.StyleContext.add_provider_for_screen(
+                Gdk.Screen.get_default(), css,
+                Gtk.STYLE_PROVIDER_PRIORITY_USER)
+
+        dlg.destroy()
+
+    def _show_shortcuts_dialog(self):
+        text = (
+            '<b>Keyboard Shortcuts</b>\n\n'
+            '<tt>Ctrl+1…9     </tt>  Navigate pages\n'
+            '<tt>Ctrl+B       </tt>  Toggle sidebar\n'
+            '<tt>Ctrl+L       </tt>  Toggle log panel\n'
+            '<tt>Ctrl+F       </tt>  Focus search\n'
+            '<tt>Ctrl+R / F5  </tt>  Refresh current page\n'
+            '<tt>Ctrl+Shift+P </tt>  Pull\n'
+            '<tt>Ctrl+Shift+U </tt>  Push\n'
+            '<tt>Ctrl+,       </tt>  Preferences\n'
+            '<tt>F11          </tt>  Fullscreen\n'
+            '<tt>Right-click  </tt>  Context menu on lists'
+        )
+        dlg = Gtk.MessageDialog(transient_for=self._win, flags=Gtk.DialogFlags.MODAL,
+                                 message_type=Gtk.MessageType.INFO,
+                                 buttons=Gtk.ButtonsType.OK)
+        dlg.set_markup(text)
+        dlg.run(); dlg.destroy()
+
+    def _show_about(self):
+        dlg = Gtk.AboutDialog(transient_for=self._win, modal=True)
+        dlg.set_program_name('SSH Git Manager')
+        dlg.set_version('0.1.0')
+        dlg.set_comments('PyGitDesk — a visual Git client with SSH key management')
+        dlg.set_license_type(Gtk.License.MIT_X11)
+        dlg.run(); dlg.destroy()
 
     @staticmethod
     def _scrolled_body() -> tuple:
@@ -867,7 +1232,7 @@ class _GTKApp:
                 r = _git(rd, 'checkout', br)
                 self.log(f'✔ {br}' if r['returncode'] == 0 else r['stderr'],
                          'ok' if r['returncode'] == 0 else 'err')
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _do_clone(*_):
             url = url_entry.get_text().strip()
@@ -904,7 +1269,7 @@ class _GTKApp:
                 finally:
                     GLib.idle_add(btn_clone.set_sensitive, True)
 
-            threading.Thread(target=_run, daemon=True).start()
+            self._run_async(_run)
 
         btn_clone.connect('clicked', _do_clone)
         return scroll
@@ -940,7 +1305,9 @@ class _GTKApp:
 
         # Paned: file list | diff
         paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-        paned.set_position(340)
+        paned.set_position(settings.get('status_paned_pos', 340))
+        paned.connect('notify::position', lambda p, _:
+                       settings.put('status_paned_pos', p.get_position()))
         outer.pack_start(paned, True, True, 0)
 
         # LEFT: file list (ListBox)
@@ -1012,7 +1379,7 @@ class _GTKApp:
                         r = _git(rd, 'diff', '--', fp)
                 GLib.idle_add(_apply_diff_colors, diff_buf,
                               r['stdout'] or '(no diff)')
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         file_list.connect('row-selected', _on_file_select)
 
@@ -1039,7 +1406,7 @@ class _GTKApp:
                 if _state.get('branch_lbl'):
                     GLib.idle_add(_state['branch_lbl'].set_markup,
                                   _markup(f'On branch: {self._current_branch or "?"}', C_GRAY))
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _stage_selected():
             rd = self._repo_path
@@ -1052,7 +1419,7 @@ class _GTKApp:
                 self.log(f'✔ Staged {fp}' if r['returncode'] == 0 else r['stderr'],
                          'ok' if r['returncode'] == 0 else 'err')
                 GLib.idle_add(_refresh)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _unstage_selected():
             rd = self._repo_path
@@ -1065,7 +1432,7 @@ class _GTKApp:
                 self.log(f'Unstaged {fp}' if r['returncode'] == 0 else r['stderr'],
                          'ok' if r['returncode'] == 0 else 'err')
                 GLib.idle_add(_refresh)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _stage_all():
             rd = self._repo_path
@@ -1075,7 +1442,7 @@ class _GTKApp:
                 self.log('✔ Staged all' if r['returncode'] == 0 else r['stderr'],
                          'ok' if r['returncode'] == 0 else 'err')
                 GLib.idle_add(_refresh)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _discard_selected():
             rd = self._repo_path
@@ -1090,7 +1457,7 @@ class _GTKApp:
                 self.log(f'✔ Discarded {fp}' if r['returncode'] == 0 else r['stderr'],
                          'ok' if r['returncode'] == 0 else 'err')
                 GLib.idle_add(_refresh)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         # Commit area
         outer.pack_start(self._sep(), False, False, 0)
@@ -1113,12 +1480,39 @@ class _GTKApp:
         char_counter.get_style_context().add_class('dim-label')
         meta_row.pack_end(char_counter, False, False, 0)
 
+        # Commit message prefix selector
+        prefix_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        commit_box.pack_start(prefix_row, False, False, 0)
+        prefix_combo = Gtk.ComboBoxText()
+        for pfx in ('', 'feat: ', 'fix: ', 'refactor: ', 'docs: ', 'chore: ',
+                     'test: ', 'style: ', 'perf: ', 'ci: '):
+            prefix_combo.append_text(pfx if pfx else '(no prefix)')
+        prefix_combo.set_active(0)
+        prefix_combo.set_tooltip_text('Conventional commit prefix')
+        prefix_row.pack_start(Gtk.Label(label='Prefix:'), False, False, 0)
+        prefix_row.pack_start(prefix_combo, False, False, 0)
+
         commit_entry = Gtk.Entry()
         commit_entry.set_placeholder_text('Commit message…')
         commit_entry.set_hexpand(True)
         commit_entry.connect('changed', lambda e: char_counter.set_label(
             f'{len(e.get_text())} chars'))
         commit_entry.connect('changed', lambda e: e.get_style_context().remove_class('commit-error'))
+
+        def _on_prefix_changed(combo):
+            txt = combo.get_active_text() or ''
+            if txt.startswith('('):
+                return
+            cur = commit_entry.get_text()
+            # Remove any existing prefix
+            for pfx in ('feat: ', 'fix: ', 'refactor: ', 'docs: ', 'chore: ',
+                         'test: ', 'style: ', 'perf: ', 'ci: '):
+                if cur.startswith(pfx):
+                    cur = cur[len(pfx):]
+                    break
+            commit_entry.set_text(txt + cur)
+            commit_entry.set_position(len(txt + cur))
+        prefix_combo.connect('changed', _on_prefix_changed)
         commit_box.pack_start(commit_entry, False, False, 0)
 
         # File-ops row
@@ -1146,6 +1540,22 @@ class _GTKApp:
             'Discard Selected', 'destructive-action', _discard_selected,
             'Permanently revert the selected file to its last committed state — cannot be recovered'), False, False, 0)
 
+        def _blame():
+            rd = self._repo_path
+            if not rd: return
+            row = file_list.get_selected_row()
+            if not row or not hasattr(row, '_fp'): return
+            fp = row._fp
+            def _do():
+                r = _git(rd, 'blame', '--date=short', fp)
+                GLib.idle_add(_apply_diff_colors, diff_buf,
+                              r['stdout'] or '(no blame output)')
+            self._run_async(_do)
+
+        file_ops_row.pack_start(_make_btn(
+            'Blame', None, _blame,
+            'Show git blame for the selected file with author and date annotations'), False, False, 0)
+
         # Commit-ops row
         commit_ops_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         commit_ops_row.set_margin_top(2)
@@ -1167,7 +1577,7 @@ class _GTKApp:
                 if r['returncode'] == 0:
                     GLib.idle_add(commit_entry.set_text, '')
                 GLib.idle_add(_refresh)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _amend():
             rd = self._repo_path
@@ -1181,7 +1591,7 @@ class _GTKApp:
                 if r['returncode'] == 0:
                     GLib.idle_add(commit_entry.set_text, '')
                 GLib.idle_add(_refresh)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _stage_all_and_commit():
             rd = self._repo_path
@@ -1203,7 +1613,7 @@ class _GTKApp:
                 if r2['returncode'] == 0:
                     GLib.idle_add(commit_entry.set_text, '')
                 GLib.idle_add(_refresh)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         commit_entry.connect('activate', lambda _: _commit())
 
@@ -1216,6 +1626,32 @@ class _GTKApp:
         commit_ops_row.pack_start(_make_btn(
             'Stage All & Commit', 'suggested-action', _stage_all_and_commit,
             'Stage every change and commit immediately — fast path for simple single-task changes'), False, False, 0)
+
+        # Context menu for file list
+        def _on_file_right_click(widget, event):
+            if event.button != 3:
+                return False
+            row = file_list.get_row_at_y(int(event.y))
+            if not row or not hasattr(row, '_fp'):
+                return False
+            file_list.select_row(row)
+            fp = row._fp
+            clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            menu = Gtk.Menu()
+            for label, cb in [
+                ('Copy File Path', lambda: clip.set_text(fp, -1)),
+                ('Stage', lambda: _stage_selected()),
+                ('Unstage', lambda: _unstage_selected()),
+                ('Blame', lambda: _blame()),
+                ('Discard', lambda: _discard_selected()),
+            ]:
+                mi = Gtk.MenuItem(label=label)
+                mi.connect('activate', lambda _, f=cb: f())
+                menu.append(mi)
+            menu.show_all()
+            menu.popup_at_pointer(event)
+            return True
+        file_list.connect('button-press-event', _on_file_right_click)
 
         self._page_reload_callbacks['status'] = _refresh
         return outer
@@ -1249,6 +1685,12 @@ class _GTKApp:
 
         log_load_all_chk.connect('toggled', _on_log_all_toggled)
         tb.pack_start(log_load_all_chk, False, False, 0)
+
+        graph_chk = Gtk.CheckButton(label='Graph')
+        graph_chk.set_tooltip_text('Show commit graph in log')
+        graph_chk.connect('toggled', lambda _: _refresh())
+        tb.pack_start(graph_chk, False, False, 0)
+
         btn_ref = Gtk.Button(label='↺ Refresh')
         btn_ref.connect('clicked', lambda _: _refresh())
         tb.pack_start(btn_ref, False, False, 0)
@@ -1269,22 +1711,34 @@ class _GTKApp:
         log_search_row.pack_start(btn_log_clear, False, False, 0)
 
         paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-        paned.set_position(480)
+        paned.set_position(settings.get('log_paned_pos', 480))
+        paned.connect('notify::position', lambda p, _:
+                       settings.put('log_paned_pos', p.get_position()))
         outer.pack_start(paned, True, True, 0)
 
-        # Commit list — store: full_hash, short_hash, author, date, subject, color
+        # Commit list — store: full_hash, graph, short_hash, author, date, subject, color
         _log_all_rows: List[list] = []
-        store = Gtk.ListStore(str, str, str, str, str, str)
+        store = Gtk.ListStore(str, str, str, str, str, str, str)
         tree = Gtk.TreeView(model=store)
         tree.set_headers_visible(True)
         tree.get_selection().set_mode(Gtk.SelectionMode.SINGLE)
+
+        # Graph column (hidden by default)
+        graph_renderer = Gtk.CellRendererText()
+        graph_renderer.set_property('family', 'monospace')
+        graph_col = Gtk.TreeViewColumn('Graph', graph_renderer, text=1, foreground=6)
+        graph_col.set_min_width(60)
+        graph_col.set_resizable(True)
+        graph_col.set_visible(False)
+        tree.append_column(graph_col)
+
         for i, (title, width, stretch) in enumerate([
             ('Hash', 72, False), ('Author', 140, False),
             ('Date', 88, False), ('Subject', 300, True)
         ]):
             r = Gtk.CellRendererText()
             r.set_property('ellipsize', Pango.EllipsizeMode.END)
-            col = Gtk.TreeViewColumn(title, r, text=i + 1, foreground=5)
+            col = Gtk.TreeViewColumn(title, r, text=i + 2, foreground=6)
             col.set_min_width(width); col.set_expand(stretch); col.set_resizable(True)
             tree.append_column(col)
 
@@ -1303,7 +1757,7 @@ class _GTKApp:
             q = log_search_entry.get_text().strip().lower()
             rows = _log_all_rows if not q else [
                 row for row in _log_all_rows
-                if q in row[1].lower() or q in row[2].lower() or q in row[4].lower()
+                if q in row[2].lower() or q in row[3].lower() or q in row[5].lower()
             ]
             total = len(rows)
             display = rows[:LOG_DISPLAY_CAP]
@@ -1335,26 +1789,54 @@ class _GTKApp:
             if not rd: return
             load_all = log_load_all_chk.get_active()
             limit = limit_entry.get_text().strip() or '500'
+            use_graph = graph_chk.get_active()
             btn_ref.set_sensitive(False)
             def _do():
-                cmd = ['log', f'--format=%H\x1f%an\x1f%ad\x1f%s', '--date=short']
+                if use_graph:
+                    # Use --graph with a separator
+                    cmd = ['log', '--graph', f'--format=%H\x1f%an\x1f%ad\x1f%s', '--date=short']
+                else:
+                    cmd = ['log', f'--format=%H\x1f%an\x1f%ad\x1f%s', '--date=short']
                 if not load_all:
                     cmd.append(f'-{limit}')
                 r = _git(rd, *cmd)
                 rows = []
                 for line in r['stdout'].splitlines():
-                    parts = line.split('\x1f', 3)
-                    if len(parts) == 4:
-                        full, author, date, subject = parts
-                        rows.append([full, full[:8], author, date, subject, '#cdd6f4'])
+                    if use_graph:
+                        # Graph chars are before the format output
+                        sep_idx = line.find('\x1f')
+                        if sep_idx < 0:
+                            # Graph-only line (merge visual)
+                            continue
+                        # Find where the hash starts (40 hex chars before first \x1f)
+                        pre = line[:sep_idx]
+                        # The hash is the last 40 chars of pre
+                        if len(pre) >= 40:
+                            graph_chars = pre[:-40]
+                            full = pre[-40:]
+                        else:
+                            continue
+                        rest = line[sep_idx + 1:]
+                        parts = rest.split('\x1f', 2)
+                        if len(parts) == 3:
+                            author, date, subject = parts
+                            rows.append([full, graph_chars.rstrip(), full[:8],
+                                         author, date, subject, '#cdd6f4'])
+                    else:
+                        parts = line.split('\x1f', 3)
+                        if len(parts) == 4:
+                            full, author, date, subject = parts
+                            rows.append([full, '', full[:8], author, date,
+                                         subject, '#cdd6f4'])
                 def _populate():
                     nonlocal _log_all_rows
                     _log_all_rows[:] = rows
                     btn_ref.set_sensitive(True)
+                    graph_col.set_visible(use_graph)
                     self.set_status(f'{len(rows)} commits loaded', C_BLUE)
                     _log_apply_filter()
                 GLib.idle_add(_populate)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _on_select(_sel):
             model, it = tree.get_selection().get_selected()
@@ -1365,11 +1847,12 @@ class _GTKApp:
             def _do():
                 r = _git(rd, 'show', '--stat', '-p', full_hash)
                 GLib.idle_add(_apply_diff_colors, diff_buf, r['stdout'])
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         tree.get_selection().connect('changed', _on_select)
 
         def _selected_hash() -> Optional[str]:
+            """Get the full hash (column 0) of the selected log entry."""
             return self._get_selected_value(tree, 0)
 
         # Actions
@@ -1390,7 +1873,7 @@ class _GTKApp:
                 self.log(r['stdout'].strip() or r['stderr'].strip(),
                          'ok' if r['returncode'] == 0 else 'err')
                 GLib.idle_add(_refresh)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _reset(mode: str):
             rd = self._require_repo()
@@ -1403,7 +1886,7 @@ class _GTKApp:
                 self.log(r['stdout'].strip() or r['stderr'].strip(),
                          'ok' if r['returncode'] == 0 else 'err')
                 GLib.idle_add(_refresh)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _cherry_pick():
             rd = self._require_repo()
@@ -1414,7 +1897,7 @@ class _GTKApp:
                 self.log(r['stdout'].strip() or r['stderr'].strip(),
                          'ok' if r['returncode'] == 0 else 'err')
                 GLib.idle_add(_refresh)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _tag():
             rd = self._require_repo()
@@ -1426,7 +1909,7 @@ class _GTKApp:
                 r = _git(rd, 'tag', name, h)
                 self.log(f'✔ Tag {name} → {h[:8]}' if r['returncode'] == 0
                          else r['stderr'], 'ok' if r['returncode'] == 0 else 'err')
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _copy_hash():
             h = _selected_hash()
@@ -1468,6 +1951,23 @@ class _GTKApp:
                     b.set_tooltip_text(_LOG_TIPS[label])
                 act.pack_start(b, False, False, 0)
 
+        # Register search entry for Ctrl+F
+        self._page_search_entries['log'] = log_search_entry
+
+        # Context menu for log tree
+        def _log_ctx_items(model, it):
+            full_hash = model.get_value(it, 0)
+            author = model.get_value(it, 2)
+            subject = model.get_value(it, 4)
+            clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            return [
+                ('Copy Hash', lambda: [clip.set_text(full_hash, -1),
+                                        self.log(f'Copied: {full_hash}', 'dim')]),
+                ('Copy Author', lambda: clip.set_text(author, -1)),
+                ('Copy Subject', lambda: clip.set_text(subject, -1)),
+            ]
+        self._add_context_menu(tree, _log_ctx_items)
+
         self._page_reload_callbacks['log'] = _refresh
         return outer
 
@@ -1500,6 +2000,44 @@ class _GTKApp:
         tb.pack_start(show_remote, False, False, 0)
         tb.pack_start(Gtk.Button(label='↺ Refresh'), False, False, 0)
         tb.get_children()[-1].connect('clicked', lambda _: _refresh())
+
+        # Branch search row
+        branch_search_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        branch_search_row.set_margin_start(18); branch_search_row.set_margin_end(18)
+        branch_search_row.set_margin_bottom(6)
+        inner.pack_start(branch_search_row, False, False, 0)
+        branch_search_row.pack_start(Gtk.Label(label='🔍 Search:'), False, False, 0)
+        branch_search_entry = Gtk.Entry()
+        branch_search_entry.set_placeholder_text('Filter branches…')
+        branch_search_entry.set_hexpand(True)
+        branch_search_row.pack_start(branch_search_entry, True, True, 0)
+        btn_branch_clear = Gtk.Button(label='✕')
+        btn_branch_clear.set_tooltip_text('Clear search')
+        btn_branch_clear.connect('clicked', lambda _: branch_search_entry.set_text(''))
+        branch_search_row.pack_start(btn_branch_clear, False, False, 0)
+        self._page_search_entries['branches'] = branch_search_entry
+
+        _all_branch_rows: List[list] = []
+        _branch_filter_timer = [0]
+
+        def _branch_apply_filter(*_):
+            q = branch_search_entry.get_text().strip().lower()
+            rows = _all_branch_rows if not q else [
+                r for r in _all_branch_rows if q in r[0].lower()
+            ]
+            store.clear()
+            for row in rows[:500]:
+                store.append(row)
+            if len(rows) > 500:
+                self.set_status(f'Showing 500 of {len(rows)} branches', C_BLUE)
+
+        def _branch_debounced_filter(*_):
+            if _branch_filter_timer[0]:
+                GLib.source_remove(_branch_filter_timer[0])
+            _branch_filter_timer[0] = GLib.timeout_add(300, lambda: [
+                _branch_apply_filter(), False][-1])
+
+        branch_search_entry.connect('changed', _branch_debounced_filter)
 
         # Branch TreeView — branch | location | notes | color | weight
         store = Gtk.ListStore(str, str, str, str, int)
@@ -1572,7 +2110,7 @@ class _GTKApp:
         stash_frame.set_margin_start(18); stash_frame.set_margin_end(18)
         stash_frame.set_margin_bottom(8)
         stash_frame.pack_start(stash_paned, True, True, 0)
-        inner.pack_start(stash_frame, False, False, 0)
+        inner.pack_start(stash_frame, True, True, 0)
 
         def _on_stash_select(sel):
             model, it = sel.get_selected()
@@ -1584,7 +2122,7 @@ class _GTKApp:
                 r = _git(rd, 'stash', 'show', '-p', ref)
                 GLib.idle_add(_apply_diff_colors, stash_diff_buf,
                               r['stdout'] or '(empty stash)')
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
         stash_tree.get_selection().connect('changed', _on_stash_select)
 
         def _refresh():
@@ -1622,18 +2160,17 @@ class _GTKApp:
                         stash_rows.append([ref.strip(), date.strip()[:10], message.strip(), C_ORANGE])
 
                 def _populate():
-                    store.clear()
-                    for row in rows:
-                        store.append(row)
+                    _all_branch_rows[:] = rows
                     stash_store.clear()
                     for row in stash_rows:
                         stash_store.append(row)
                     if capped:
                         self.log(f'Showing first {BRANCH_CAP} branches (too many to display all)', 'warn')
+                    _branch_apply_filter()
 
                 GLib.idle_add(_populate)
 
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _get_branch() -> Optional[str]:
             return self._get_selected_value(tree, 0)
@@ -1655,7 +2192,7 @@ class _GTKApp:
                     GLib.idle_add(_refresh)
                 else:
                     self.log(r['stderr'] or r['stdout'], 'err')
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _new_branch():
             rd = self._require_repo()
@@ -1674,7 +2211,7 @@ class _GTKApp:
                     GLib.idle_add(_refresh)
                 else:
                     self.log(r['stderr'] or r['stdout'], 'err')
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _delete_branch():
             rd = self._require_repo(); br = _get_branch()
@@ -1687,7 +2224,7 @@ class _GTKApp:
                 self.log(f'✔ Deleted {br}' if r['returncode'] == 0 else r['stderr'],
                          'ok' if r['returncode'] == 0 else 'err')
                 GLib.idle_add(_refresh)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _pull():
             rd = self._require_repo()
@@ -1700,7 +2237,7 @@ class _GTKApp:
                 if r['returncode'] != 0: self.log(r['stderr'], 'err')
                 self.set_status('Pull done' if r['returncode'] == 0 else 'Pull failed',
                                 C_GREEN if r['returncode'] == 0 else C_RED)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _push(upstream=False):
             rd = self._require_repo()
@@ -1715,7 +2252,7 @@ class _GTKApp:
                          'ok' if r['returncode'] == 0 else 'err')
                 self.set_status('Push done' if r['returncode'] == 0 else 'Push failed',
                                 C_GREEN if r['returncode'] == 0 else C_RED)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _fetch_all():
             rd = self._require_repo()
@@ -1726,7 +2263,7 @@ class _GTKApp:
                 self.log(r['stdout'].strip() or r['stderr'].strip() or '✔ Fetched',
                          'ok' if r['returncode'] == 0 else 'warn')
                 GLib.idle_add(_refresh)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _stash_push():
             rd = self._require_repo()
@@ -1738,7 +2275,7 @@ class _GTKApp:
                 self.log(r['stdout'].strip() or r['stderr'].strip(),
                          'ok' if r['returncode'] == 0 else 'err')
                 GLib.idle_add(_refresh)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _stash_action(action: str):
             rd = self._repo_path
@@ -1756,21 +2293,25 @@ class _GTKApp:
                 self.log(r['stdout'].strip() or r['stderr'].strip(),
                          'ok' if r['returncode'] == 0 else 'err')
                 GLib.idle_add(_refresh)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _stash_refresh():
             rd = self._repo_path
             if not rd: return
             def _do():
-                stash_store.clear()
                 sr = _git(rd, 'stash', 'list', '--format=%gd|%ci|%s')
+                rows = []
                 for line in sr['stdout'].splitlines():
                     parts = line.split('|', 2)
                     if len(parts) == 3:
                         ref, date, message = parts
-                        GLib.idle_add(stash_store.append,
-                                      [ref.strip(), date.strip()[:10], message.strip(), C_ORANGE])
-            threading.Thread(target=_do, daemon=True).start()
+                        rows.append([ref.strip(), date.strip()[:10], message.strip(), C_ORANGE])
+                def _populate():
+                    stash_store.clear()
+                    for row in rows:
+                        stash_store.append(row)
+                GLib.idle_add(_populate)
+            self._run_async(_do)
         stash_refresh_btn.connect('clicked', lambda _: _stash_refresh())
 
         tree.connect('row-activated', lambda *_: _checkout())
@@ -1818,6 +2359,17 @@ class _GTKApp:
              'Permanently delete the selected stash entry — this cannot be undone'),
         )
         outer.pack_start(stash_act, False, False, 0)
+
+        # Context menu for branch tree
+        def _branch_ctx_items(model, it):
+            br = model.get_value(it, 0)
+            clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            return [
+                ('Copy Branch Name', lambda: clip.set_text(br, -1)),
+                ('Checkout', lambda: _checkout()),
+                ('Delete', lambda: _delete_branch()),
+            ]
+        self._add_context_menu(tree, _branch_ctx_items)
 
         self._page_reload_callbacks['branches'] = _refresh
         return outer
@@ -1919,7 +2471,7 @@ class _GTKApp:
 
                 GLib.idle_add(_apply)
 
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _do_merge():
             rd = self._require_repo()
@@ -1936,7 +2488,7 @@ class _GTKApp:
                          'ok' if r['returncode'] == 0 else 'err')
                 self.set_status('Merge done' if r['returncode'] == 0 else 'Merge failed',
                                 C_GREEN if r['returncode'] == 0 else C_RED)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _abort_merge():
             rd = self._require_repo()
@@ -1945,7 +2497,7 @@ class _GTKApp:
                 r = _git(rd, 'merge', '--abort')
                 self.log(r['stdout'].strip() or r['stderr'].strip() or '✔ Merge aborted',
                          'ok' if r['returncode'] == 0 else 'err')
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _do_rebase():
             rd = self._require_repo()
@@ -1957,7 +2509,7 @@ class _GTKApp:
                 r = _git(rd, 'rebase', onto)
                 self.log(r['stdout'].strip() or r['stderr'].strip(),
                          'ok' if r['returncode'] == 0 else 'err')
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _rebase_ctrl(action: str):
             rd = self._require_repo()
@@ -1966,7 +2518,7 @@ class _GTKApp:
                 r = _git(rd, 'rebase', f'--{action}')
                 self.log(r['stdout'].strip() or r['stderr'].strip(),
                          'ok' if r['returncode'] == 0 else 'err')
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _cherry_pick_prompt():
             rd = self._require_repo()
@@ -1977,7 +2529,7 @@ class _GTKApp:
                 r = _git(rd, 'cherry-pick', h)
                 self.log(r['stdout'].strip() or r['stderr'].strip(),
                          'ok' if r['returncode'] == 0 else 'err')
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _revert_prompt():
             rd = self._require_repo()
@@ -1988,7 +2540,7 @@ class _GTKApp:
                 r = _git(rd, 'revert', '--no-edit', h)
                 self.log(r['stdout'].strip() or r['stderr'].strip(),
                          'ok' if r['returncode'] == 0 else 'err')
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _reset_hard_head():
             rd = self._require_repo()
@@ -1999,7 +2551,7 @@ class _GTKApp:
                 r = _git(rd, 'reset', '--hard', 'HEAD')
                 self.log(r['stdout'].strip() or r['stderr'].strip(),
                          'ok' if r['returncode'] == 0 else 'err')
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         btn_merge.connect('clicked', lambda _: _do_merge())
         btn_abort_merge.connect('clicked', lambda _: _abort_merge())
@@ -2287,7 +2839,7 @@ class _GTKApp:
 
                 GLib.idle_add(_done)
 
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _select_all(*_):
             for row in revert_store:
@@ -2340,7 +2892,7 @@ class _GTKApp:
                     GLib.idle_add(self.set_status,
                                   f'✔ Reverted {ok_count} commit(s)', C_GREEN)
                     self.log(f'✔ All {ok_count} commit(s) reverted successfully', 'ok')
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         btn_load_commits.connect('clicked', _load_revert_commits)
         btn_select_all.connect('clicked', _select_all)
@@ -2368,7 +2920,20 @@ class _GTKApp:
 
                 GLib.idle_add(_apply)
 
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
+
+        self._page_search_entries['commits'] = search_entry
+
+        # Context menu for revert tree
+        def _commits_ctx_items(model, it):
+            h = model.get_value(it, 1)
+            subj = model.get_value(it, 3)
+            clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            return [
+                ('Copy Hash', lambda: clip.set_text(h, -1)),
+                ('Copy Subject', lambda: clip.set_text(subj, -1)),
+            ]
+        self._add_context_menu(revert_tree, _commits_ctx_items)
 
         self._page_reload_callbacks['commits'] = _populate_commits_branches
         return scroll
@@ -2456,7 +3021,7 @@ class _GTKApp:
 
                 GLib.idle_add(_populate)
 
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _sel() -> tuple:
             model, it = tree.get_selection().get_selected()
@@ -2484,7 +3049,7 @@ class _GTKApp:
                 if not dry: GLib.idle_add(_refresh)
                 self.set_status('Done' if not dry else 'Dry run done',
                                 C_GREEN if not dry else C_BLUE)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _add_remote():
             rd = self._require_repo()
@@ -2498,7 +3063,7 @@ class _GTKApp:
                 self.log(f'✔ Added {name}' if r['returncode'] == 0 else r['stderr'],
                          'ok' if r['returncode'] == 0 else 'err')
                 GLib.idle_add(_refresh)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _remove_remote():
             rd = self._require_repo(); name, _ = _sel()
@@ -2509,7 +3074,7 @@ class _GTKApp:
                 self.log(f'✔ Removed {name}' if r['returncode'] == 0 else r['stderr'],
                          'ok' if r['returncode'] == 0 else 'err')
                 GLib.idle_add(_refresh)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _rename_remote():
             rd = self._require_repo(); name, _ = _sel()
@@ -2521,7 +3086,7 @@ class _GTKApp:
                 self.log(f'✔ Renamed {name} → {new}' if r['returncode'] == 0 else r['stderr'],
                          'ok' if r['returncode'] == 0 else 'err')
                 GLib.idle_add(_refresh)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _set_url():
             rd = self._require_repo(); name, old = _sel()
@@ -2533,7 +3098,7 @@ class _GTKApp:
                 self.log(f'✔ {name} → {new}' if r['returncode'] == 0 else r['stderr'],
                          'ok' if r['returncode'] == 0 else 'err')
                 GLib.idle_add(_refresh)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _fetch(sel_only=False):
             rd = self._require_repo()
@@ -2546,7 +3111,7 @@ class _GTKApp:
                 r = _git(rd, *args)
                 self.log(r['stdout'].strip() or r['stderr'].strip() or '✔ Fetched',
                          'ok' if r['returncode'] == 0 else 'warn')
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         outer.pack_start(self._sep(), False, False, 0)
         outer.pack_start(self._action_bar(
@@ -2564,6 +3129,17 @@ class _GTKApp:
             ('Fetch All',       None,                 _fetch,
              'Download new objects from every configured remote'),
         ), False, False, 0)
+
+        # Context menu for remote tree
+        def _remote_ctx_items(model, it):
+            name = model.get_value(it, 0)
+            url = model.get_value(it, 1)
+            clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            return [
+                ('Copy Remote Name', lambda: clip.set_text(name, -1)),
+                ('Copy URL', lambda: clip.set_text(url, -1)),
+            ]
+        self._add_context_menu(tree, _remote_ctx_items)
 
         self._page_reload_callbacks['remotes'] = _refresh
         return outer
@@ -2642,7 +3218,7 @@ class _GTKApp:
                         store.append([path, branch, head, flags, color])
                 GLib.idle_add(_populate)
                 self.set_status(f'{len(trees)} worktree(s)', C_BLUE)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _sel_path() -> Optional[str]:
             return self._get_selected_value(tree, 0)
@@ -2665,7 +3241,7 @@ class _GTKApp:
                 self.log(r['stdout'].strip() or r['stderr'].strip(),
                          'ok' if r['returncode'] == 0 else 'err')
                 GLib.idle_add(_refresh)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _remove_worktree():
             rd = self._require_repo(); path = _sel_path()
@@ -2678,7 +3254,7 @@ class _GTKApp:
                 self.log(r['stdout'].strip() or r['stderr'].strip(),
                          'ok' if r['returncode'] == 0 else 'err')
                 GLib.idle_add(_refresh)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _lock_worktree():
             rd = self._require_repo(); path = _sel_path()
@@ -2690,7 +3266,7 @@ class _GTKApp:
                 self.log(r['stdout'].strip() or r['stderr'].strip() or '✔ Locked',
                          'ok' if r['returncode'] == 0 else 'err')
                 GLib.idle_add(_refresh)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _unlock_worktree():
             rd = self._require_repo(); path = _sel_path()
@@ -2700,7 +3276,7 @@ class _GTKApp:
                 self.log(r['stdout'].strip() or r['stderr'].strip() or '✔ Unlocked',
                          'ok' if r['returncode'] == 0 else 'err')
                 GLib.idle_add(_refresh)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _open_fm():
             path = _sel_path()
@@ -2715,7 +3291,7 @@ class _GTKApp:
                 self.log(r['stdout'].strip() or r['stderr'].strip() or '✔ Pruned',
                          'ok' if r['returncode'] == 0 else 'err')
                 GLib.idle_add(_refresh)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         outer.pack_start(self._sep(), False, False, 0)
         outer.pack_start(self._action_bar(
@@ -2810,7 +3386,7 @@ class _GTKApp:
                     self.log(f'Found {len(keys)} key(s)', 'info')
                     self.set_status(f'{len(keys)} key(s) found', C_BLUE)
                 GLib.idle_add(_populate)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _sel_path() -> Optional[str]:
             return self._get_selected_value(tree, 0)
@@ -2829,7 +3405,7 @@ class _GTKApp:
                 else:
                     self.log(f'{r.get("reason")} ({r.get("current_mode")})', 'dim')
                 GLib.idle_add(_refresh)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _fix_all():
             def _do():
@@ -2841,7 +3417,7 @@ class _GTKApp:
                             self.log(f'✔ Fixed {k["path"]}', 'ok'); fixed += 1
                 self.log(f'Fixed {fixed} key(s)', 'info' if fixed else 'dim')
                 GLib.idle_add(_refresh)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _add_agent():
             path = _sel_path()
@@ -2852,7 +3428,7 @@ class _GTKApp:
                          else f'✖ {r.get("reason") or r.get("stderr") or "Failed"}',
                          'ok' if r.get('added') else 'err')
                 GLib.idle_add(_refresh)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         def _remove_agent():
             path = _sel_path()
@@ -2863,7 +3439,7 @@ class _GTKApp:
                 self.log('✔ Removed from agent' if r.returncode == 0
                          else r.stderr.strip(), 'ok' if r.returncode == 0 else 'err')
                 GLib.idle_add(_refresh)
-            threading.Thread(target=_do, daemon=True).start()
+            self._run_async(_do)
 
         outer.pack_start(self._sep(), False, False, 0)
         outer.pack_start(self._action_bar(
